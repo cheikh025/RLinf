@@ -12,11 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import logging
+import os
 from typing import Any, Optional
 
 import numpy as np
 import torch
+from einops import rearrange
 from groot.vla.model.dreamzero.base_vla import VLA
 from tianshou.data import Batch
 
@@ -27,6 +30,9 @@ from rlinf.data.datasets.dreamzero.data_transforms import (
 )
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
 from rlinf.models.embodiment.dreamzero.dreamzero_config import DreamZeroConfig
+from rlinf.utils.logging import get_logger
+
+logger = get_logger()
 
 
 class DreamZeroPolicy(VLA, BasePolicy):
@@ -57,6 +63,8 @@ class DreamZeroPolicy(VLA, BasePolicy):
             config.data_transforms, embodiment_tag
         )
         self._action_keys = tuple(action_keys)
+        # Debug counter for save_video_pred (see _maybe_save_video_pred).
+        self._video_pred_call_count = 0
 
     # This method is called in FSDPModelManager.setup_model_and_optimizer
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs={}):
@@ -278,6 +286,12 @@ class DreamZeroPolicy(VLA, BasePolicy):
         with torch.no_grad():
             model_pred = self.lazy_joint_video_action_causal(normalized_input)
 
+        self._maybe_save_video_pred(
+            model_pred.get("video_pred"),
+            mode=mode,
+            input_images=normalized_input.get("images"),
+        )
+
         normalized_action = model_pred["action_pred"].float()
 
         batch = self.unapply(
@@ -303,6 +317,110 @@ class DreamZeroPolicy(VLA, BasePolicy):
             "forward_inputs": forward_inputs,
         }
         return actions, result
+
+    def _maybe_save_video_pred(
+        self,
+        video_pred: Optional[torch.Tensor],
+        mode: str,
+        input_images: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Decode and save DreamZero's dreamed video chunk as MP4 (debug only).
+
+        Enabled with ``actor.model.save_video_pred=true``. ``video_pred`` is the
+        WAN VAE latent ``[B, C, T, H, W]`` returned by
+        ``lazy_joint_video_action_causal``; it is decoded with
+        ``action_head.vae.decode`` (same recipe as
+        ``dreamzero/eval_utils/serve_dreamzero_wan22.py``) and written as
+        ``<mode>_call_<N>.mp4`` under ``actor.model.video_pred_output_dir``.
+        Tensor shapes (latent, decoded, RGB width/height/frames) are logged and
+        appended to ``video_pred_info.jsonl`` for later verification.
+        Optional: ``video_pred_max_calls`` caps saved calls,
+        ``video_pred_fps`` sets MP4 fps (default 5, as in DreamZero serving).
+        """
+        if not getattr(self.config, "save_video_pred", False):
+            return
+        if video_pred is None:
+            logger.warning(
+                "save_video_pred is enabled but the model returned no video_pred."
+            )
+            return
+        max_calls = getattr(self.config, "video_pred_max_calls", None)
+        if max_calls is not None and self._video_pred_call_count >= int(max_calls):
+            return
+
+        try:
+            import imageio
+        except ImportError as exc:
+            raise ImportError(
+                "imageio is required to save dreamed videos; install rlinf[embodied]."
+            ) from exc
+
+        output_dir = getattr(
+            self.config, "video_pred_output_dir", "dreamzero_video_pred"
+        )
+        fps = int(getattr(self.config, "video_pred_fps", 5))
+        os.makedirs(output_dir, exist_ok=True)
+
+        if input_images is not None:
+            logger.info(
+                "[dreamzero video debug] normalized_input['images'].shape = %s",
+                tuple(input_images.shape),
+            )
+        logger.info(
+            "[dreamzero video debug] video_pred latent shape = %s",
+            tuple(video_pred.shape),
+        )
+
+        action_head = self.action_head
+        with torch.no_grad():
+            frames = action_head.vae.decode(
+                video_pred,
+                tiled=action_head.tiled,
+                tile_size=(
+                    action_head.tile_size_height,
+                    action_head.tile_size_width,
+                ),
+                tile_stride=(
+                    action_head.tile_stride_height,
+                    action_head.tile_stride_width,
+                ),
+            )
+        logger.info(
+            "[dreamzero video debug] decoded frames B C T H W shape = %s",
+            tuple(frames.shape),
+        )
+
+        rgb = rearrange(frames, "B C T H W -> B T H W C")
+        rgb = ((rgb.float() + 1) * 127.5).clip(0, 255).cpu().numpy().astype(np.uint8)
+        logger.info(
+            "[dreamzero video debug] decoded RGB B T H W C shape = %s", rgb.shape
+        )
+
+        call_index = self._video_pred_call_count
+        info_path = os.path.join(output_dir, "video_pred_info.jsonl")
+        for env_idx in range(rgb.shape[0]):
+            suffix = "" if rgb.shape[0] == 1 else f"_env{env_idx}"
+            mp4_path = os.path.join(
+                output_dir, f"{mode}_call_{call_index:06d}{suffix}.mp4"
+            )
+            imageio.mimsave(mp4_path, list(rgb[env_idx]), fps=fps, codec="libx264")
+            info = {
+                "call_index": call_index,
+                "mode": mode,
+                "env_index": env_idx,
+                "mp4_path": mp4_path,
+                "latent_shape": list(video_pred.shape),
+                "decoded_shape": list(frames.shape),
+                "num_frames": int(rgb.shape[1]),
+                "height": int(rgb.shape[2]),
+                "width": int(rgb.shape[3]),
+                "channels": int(rgb.shape[4]),
+                "fps": fps,
+            }
+            with open(info_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(info) + "\n")
+            logger.info("[dreamzero video debug] saved mp4 path = %s", mp4_path)
+        self._video_pred_call_count += 1
 
     def forward(self, forward_type=ForwardType.DEFAULT, **kwargs):
         if forward_type == ForwardType.DEFAULT:
