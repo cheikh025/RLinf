@@ -65,6 +65,8 @@ class DreamZeroPolicy(VLA, BasePolicy):
         self._action_keys = tuple(action_keys)
         # Debug counter for save_video_pred (see _maybe_save_video_pred).
         self._video_pred_call_count = 0
+        # Counter for best-of-K candidate sampling (see _predict_best_of_k).
+        self._bok_call_count = 0
 
     # This method is called in FSDPModelManager.setup_model_and_optimizer
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs={}):
@@ -283,14 +285,23 @@ class DreamZeroPolicy(VLA, BasePolicy):
         batch = Batch(obs=converted_obs)
         # ---------- DreamZero inference ----------
         normalized_input = self._process_batch(batch)
-        with torch.no_grad():
-            model_pred = self.lazy_joint_video_action_causal(normalized_input)
+        best_of_k = int(getattr(self.config, "best_of_k", 1) or 1)
+        if best_of_k > 1:
+            model_pred = self._predict_best_of_k(
+                normalized_input,
+                mode=mode,
+                num_candidates=best_of_k,
+                obs=converted_obs,
+            )
+        else:
+            with torch.no_grad():
+                model_pred = self.lazy_joint_video_action_causal(normalized_input)
 
-        self._maybe_save_video_pred(
-            model_pred.get("video_pred"),
-            mode=mode,
-            input_images=normalized_input.get("images"),
-        )
+            self._maybe_save_video_pred(
+                model_pred.get("video_pred"),
+                mode=mode,
+                input_images=normalized_input.get("images"),
+            )
 
         normalized_action = model_pred["action_pred"].float()
 
@@ -318,11 +329,154 @@ class DreamZeroPolicy(VLA, BasePolicy):
         }
         return actions, result
 
+    def _predict_best_of_k(
+        self,
+        normalized_input: dict[str, Any],
+        mode: str,
+        num_candidates: int,
+        obs: dict,
+    ):
+        """Sample K independent (action, video) candidates by varying the seed.
+
+        Milestone 1 of best-of-K (see dreamzero_prm_best_of_k_README.md): the
+        action head seeds its diffusion noise with a fixed ``seed`` attribute,
+        so K calls with the same seed are bit-identical. Candidate ``k`` uses
+        ``base_seed + k``; candidate 0 keeps the head's original seed (unless
+        ``bok_base_seed`` overrides it), so the executed behavior is exactly
+        the single-sample path. RLinf feeds a single frame per call, which
+        resets the head's stream state (``current_start_frame``/KV caches) at
+        the start of every call, so the K samplings are independent.
+
+        The executed result is always candidate 0; the other candidates are
+        only saved/logged for diversity verification (no scorer yet).
+
+        Enabled with ``actor.model.best_of_k`` > 1. Optional:
+        ``bok_base_seed`` (default: the head's own seed), ``bok_output_dir``
+        (default "dreamzero_best_of_k") for the diversity jsonl.
+        """
+        action_head = self.action_head
+        if not hasattr(action_head, "seed"):
+            raise AttributeError(
+                "DreamZero action head has no `seed` attribute; "
+                "best_of_k requires it to vary the diffusion noise."
+            )
+        original_seed = int(action_head.seed)
+        base_seed = getattr(self.config, "bok_base_seed", None)
+        base_seed = original_seed if base_seed is None else int(base_seed)
+
+        candidates = []
+        seeds = []
+        try:
+            for k in range(num_candidates):
+                seed = base_seed + k
+                action_head.seed = seed
+                with torch.no_grad():
+                    pred = self.lazy_joint_video_action_causal(normalized_input)
+                candidates.append(pred)
+                seeds.append(seed)
+                self._maybe_save_video_pred(
+                    pred.get("video_pred"),
+                    mode=mode,
+                    input_images=normalized_input.get("images") if k == 0 else None,
+                    candidate_index=k,
+                    seed=seed,
+                    increment_call=(k == num_candidates - 1),
+                )
+        finally:
+            action_head.seed = original_seed
+
+        self._log_best_of_k_diversity(candidates, seeds, mode=mode, obs=obs)
+        return candidates[0]
+
+    def _log_best_of_k_diversity(
+        self,
+        candidates: list,
+        seeds: list[int],
+        mode: str,
+        obs: dict,
+    ) -> None:
+        """Log and persist how different the K candidates are.
+
+        Diversity is measured on the normalized model-space ``action_pred``
+        (pairwise L2 over flattened chunks). A max pairwise distance of
+        exactly 0 means seed variation had no effect (all candidates
+        identical) and a warning is logged. Per-candidate env-space actions
+        (un-normalized via ``unapply``, before gripper binarization) are
+        written to ``<bok_output_dir>/best_of_k_info.jsonl`` for inspection.
+        """
+        actions = torch.stack(
+            [c["action_pred"].detach().float().cpu() for c in candidates]
+        )  # [K, B, T, D] in normalized model space
+        k = actions.shape[0]
+        flat = actions.reshape(k, -1)
+        dist = torch.cdist(flat, flat)  # [K, K]
+        iu = torch.triu_indices(k, k, offset=1)
+        pairwise = dist[iu[0], iu[1]]
+        mean_l2 = pairwise.mean().item()
+        min_l2 = pairwise.min().item()
+        max_l2 = pairwise.max().item()
+        identical = max_l2 == 0.0
+
+        call_index = self._bok_call_count
+        logger.info(
+            "[dreamzero best-of-k] call %d (%s): K=%d seeds=%s "
+            "normalized-action pairwise L2 mean=%.4f min=%.4f max=%.4f",
+            call_index,
+            mode,
+            k,
+            seeds,
+            mean_l2,
+            min_l2,
+            max_l2,
+        )
+        if identical:
+            logger.warning(
+                "[dreamzero best-of-k] all %d candidates are bit-identical; "
+                "seed variation had no effect.",
+                k,
+            )
+        elif min_l2 == 0.0:
+            logger.warning(
+                "[dreamzero best-of-k] at least one candidate pair is "
+                "bit-identical (min pairwise L2 = 0); check seed handling."
+            )
+
+        env_actions = []
+        for cand in candidates:
+            cand_batch = self.unapply(
+                Batch(normalized_action=cand["action_pred"].float()),
+                obs=obs,
+            )
+            env_actions.append(self._actions_from_unapply(cand_batch.act))
+
+        output_dir = getattr(self.config, "bok_output_dir", "dreamzero_best_of_k")
+        os.makedirs(output_dir, exist_ok=True)
+        info = {
+            "call_index": call_index,
+            "mode": mode,
+            "k": k,
+            "seeds": seeds,
+            "action_pred_shape": list(actions.shape[1:]),
+            "pairwise_l2_normalized": dist.tolist(),
+            "pairwise_l2_mean": mean_l2,
+            "pairwise_l2_min": min_l2,
+            "pairwise_l2_max": max_l2,
+            "identical": identical,
+            "env_actions_per_candidate": [np.asarray(a).tolist() for a in env_actions],
+        }
+        info_path = os.path.join(output_dir, "best_of_k_info.jsonl")
+        with open(info_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(info) + "\n")
+        self._bok_call_count += 1
+
     def _maybe_save_video_pred(
         self,
         video_pred: Optional[torch.Tensor],
         mode: str,
         input_images: Optional[torch.Tensor] = None,
+        candidate_index: Optional[int] = None,
+        seed: Optional[int] = None,
+        increment_call: bool = True,
     ) -> None:
         """Decode and save DreamZero's dreamed video chunk as MP4 (debug only).
 
@@ -336,6 +490,12 @@ class DreamZeroPolicy(VLA, BasePolicy):
         appended to ``video_pred_info.jsonl`` for later verification.
         Optional: ``video_pred_max_calls`` caps saved calls,
         ``video_pred_fps`` sets MP4 fps (default 5, as in DreamZero serving).
+
+        With best-of-K (``_predict_best_of_k``), ``candidate_index``/``seed``
+        tag each candidate (``_cand<k>`` filename suffix, extra jsonl fields)
+        and ``increment_call`` advances the call counter only once per
+        env step (after the last candidate), so ``video_pred_max_calls``
+        still counts env steps, not files.
         """
         if not getattr(self.config, "save_video_pred", False):
             return
@@ -397,11 +557,12 @@ class DreamZeroPolicy(VLA, BasePolicy):
         )
 
         call_index = self._video_pred_call_count
+        cand_suffix = "" if candidate_index is None else f"_cand{candidate_index}"
         info_path = os.path.join(output_dir, "video_pred_info.jsonl")
         for env_idx in range(rgb.shape[0]):
             suffix = "" if rgb.shape[0] == 1 else f"_env{env_idx}"
             mp4_path = os.path.join(
-                output_dir, f"{mode}_call_{call_index:06d}{suffix}.mp4"
+                output_dir, f"{mode}_call_{call_index:06d}{cand_suffix}{suffix}.mp4"
             )
             imageio.mimsave(mp4_path, list(rgb[env_idx]), fps=fps, codec="libx264")
             info = {
@@ -417,10 +578,15 @@ class DreamZeroPolicy(VLA, BasePolicy):
                 "channels": int(rgb.shape[4]),
                 "fps": fps,
             }
+            if candidate_index is not None:
+                info["candidate_index"] = int(candidate_index)
+            if seed is not None:
+                info["seed"] = int(seed)
             with open(info_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(info) + "\n")
             logger.info("[dreamzero video debug] saved mp4 path = %s", mp4_path)
-        self._video_pred_call_count += 1
+        if increment_call:
+            self._video_pred_call_count += 1
 
     def forward(self, forward_type=ForwardType.DEFAULT, **kwargs):
         if forward_type == ForwardType.DEFAULT:
