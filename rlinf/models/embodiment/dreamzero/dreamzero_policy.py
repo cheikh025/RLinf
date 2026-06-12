@@ -397,49 +397,17 @@ class DreamZeroPolicy(VLA, BasePolicy):
     ) -> None:
         """Log and persist how different the K candidates are.
 
-        Diversity is measured on the normalized model-space ``action_pred``
-        (pairwise L2 over flattened chunks). A max pairwise distance of
-        exactly 0 means seed variation had no effect (all candidates
-        identical) and a warning is logged. Per-candidate env-space actions
-        (un-normalized via ``unapply``, before gripper binarization) are
-        written to ``<bok_output_dir>/best_of_k_info.jsonl`` for inspection.
+        Diversity is measured on the **env-space actions** (un-normalized via
+        ``unapply``, before gripper binarization): pairwise L2 over flattened
+        chunks of the real environment dims (e.g. 7 for LIBERO). The raw
+        32-wide ``action_pred`` is NOT used for stats because dims beyond the
+        env width are training-masked padding with unconstrained values; it
+        is only used as a bit-identical check (max pairwise L2 == 0 on the
+        full output means seed variation had no effect) and a warning is
+        logged. Per-candidate env-space actions and the env-space distance
+        matrix are written to ``<bok_output_dir>/best_of_k_info.jsonl``.
         """
-        actions = torch.stack(
-            [c["action_pred"].detach().float().cpu() for c in candidates]
-        )  # [K, B, T, D] in normalized model space
-        k = actions.shape[0]
-        flat = actions.reshape(k, -1)
-        dist = torch.cdist(flat, flat)  # [K, K]
-        iu = torch.triu_indices(k, k, offset=1)
-        pairwise = dist[iu[0], iu[1]]
-        mean_l2 = pairwise.mean().item()
-        min_l2 = pairwise.min().item()
-        max_l2 = pairwise.max().item()
-        identical = max_l2 == 0.0
-
-        call_index = self._bok_call_count
-        logger.info(
-            "[dreamzero best-of-k] call %d (%s): K=%d seeds=%s "
-            "normalized-action pairwise L2 mean=%.4f min=%.4f max=%.4f",
-            call_index,
-            mode,
-            k,
-            seeds,
-            mean_l2,
-            min_l2,
-            max_l2,
-        )
-        if identical:
-            logger.warning(
-                "[dreamzero best-of-k] all %d candidates are bit-identical; "
-                "seed variation had no effect.",
-                k,
-            )
-        elif min_l2 == 0.0:
-            logger.warning(
-                "[dreamzero best-of-k] at least one candidate pair is "
-                "bit-identical (min pairwise L2 = 0); check seed handling."
-            )
+        k = len(candidates)
 
         env_actions = []
         for cand in candidates:
@@ -447,7 +415,51 @@ class DreamZeroPolicy(VLA, BasePolicy):
                 Batch(normalized_action=cand["action_pred"].float()),
                 obs=obs,
             )
-            env_actions.append(self._actions_from_unapply(cand_batch.act))
+            env_actions.append(np.asarray(self._actions_from_unapply(cand_batch.act)))
+
+        # Stats on the real env dims only (padding dims are meaningless).
+        env_stack = torch.as_tensor(
+            np.stack(env_actions), dtype=torch.float32
+        )  # [K, B, T, env_dim]
+        env_flat = env_stack.reshape(k, -1)
+        env_dist = torch.cdist(env_flat, env_flat)  # [K, K]
+        iu = torch.triu_indices(k, k, offset=1)
+        env_pairwise = env_dist[iu[0], iu[1]]
+        mean_l2 = env_pairwise.mean().item()
+        min_l2 = env_pairwise.min().item()
+        max_l2 = env_pairwise.max().item()
+
+        # Bit-identical check on the full model output (catches broken seeds
+        # even if differences were only in padded dims).
+        raw = torch.stack(
+            [c["action_pred"].detach().float().cpu() for c in candidates]
+        ).reshape(k, -1)
+        raw_identical = torch.cdist(raw, raw)[iu[0], iu[1]].max().item() == 0.0
+
+        call_index = self._bok_call_count
+        logger.info(
+            "[dreamzero best-of-k] call %d (%s): K=%d seeds=%s "
+            "env-action (%dd) pairwise L2 mean=%.4f min=%.4f max=%.4f",
+            call_index,
+            mode,
+            k,
+            seeds,
+            env_stack.shape[-1],
+            mean_l2,
+            min_l2,
+            max_l2,
+        )
+        if raw_identical:
+            logger.warning(
+                "[dreamzero best-of-k] all %d candidates are bit-identical; "
+                "seed variation had no effect.",
+                k,
+            )
+        elif min_l2 == 0.0:
+            logger.warning(
+                "[dreamzero best-of-k] at least one candidate pair has "
+                "identical env-space actions (min pairwise L2 = 0)."
+            )
 
         output_dir = getattr(self.config, "bok_output_dir", "dreamzero_best_of_k")
         os.makedirs(output_dir, exist_ok=True)
@@ -456,13 +468,13 @@ class DreamZeroPolicy(VLA, BasePolicy):
             "mode": mode,
             "k": k,
             "seeds": seeds,
-            "action_pred_shape": list(actions.shape[1:]),
-            "pairwise_l2_normalized": dist.tolist(),
+            "env_action_shape": list(env_stack.shape[1:]),
+            "pairwise_l2_env": env_dist.tolist(),
             "pairwise_l2_mean": mean_l2,
             "pairwise_l2_min": min_l2,
             "pairwise_l2_max": max_l2,
-            "identical": identical,
-            "env_actions_per_candidate": [np.asarray(a).tolist() for a in env_actions],
+            "identical": raw_identical,
+            "env_actions_per_candidate": [a.tolist() for a in env_actions],
         }
         info_path = os.path.join(output_dir, "best_of_k_info.jsonl")
         with open(info_path, "a", encoding="utf-8") as f:
