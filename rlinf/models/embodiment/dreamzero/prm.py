@@ -45,6 +45,14 @@ def _huber(x: torch.Tensor, delta: torch.Tensor) -> torch.Tensor:
     return torch.where(ax <= delta, 0.5 * (x**2), delta * (ax - 0.5 * delta))
 
 
+def _per_env_payload(name: str, values: torch.Tensor) -> dict[str, Any]:
+    """Return per-env values, plus flat candidate values only for B == 1."""
+    payload = {f"{name}_per_env": values.tolist()}
+    if values.shape[1] == 1:
+        payload[name] = values[:, 0].tolist()
+    return payload
+
+
 class ExecutabilityScorer:
     """Score env-space action chunks for physical executability (r_exec).
 
@@ -98,7 +106,7 @@ class ExecutabilityScorer:
         self,
         env_actions: torch.Tensor,
         prev_action: Optional[torch.Tensor] = None,
-    ) -> dict[str, list[float]]:
+    ) -> dict[str, Any]:
         """Compute executability penalties for K candidate chunks.
 
         Args:
@@ -107,8 +115,8 @@ class ExecutabilityScorer:
                 previous chunk, prepended for seam continuity.
 
         Returns:
-            Dict of per-candidate lists (length K): ``alim_pen``, ``acc_pen``,
-            ``jerk_pen``, ``flip_pen``, ``penalty`` (weighted total).
+            Dict with ``*_per_env`` matrices shaped ``[K, B]``. For ``B == 1``,
+            flat per-candidate lists are also included for concise logging.
         """
         chunk = torch.as_tensor(env_actions, dtype=torch.float32)
         if chunk.ndim != 4:
@@ -133,14 +141,14 @@ class ExecutabilityScorer:
         jerk = accel[:, :, 1:] - accel[:, :, :-1]
 
         violate = torch.relu(accel.abs() - self.acc_bounds)
-        alim_pen = (violate**2).mean(dim=(1, 2, 3))
-        acc_pen = _huber(accel, self.acc_huber_delta).mean(dim=(1, 2, 3))
-        jerk_pen = _huber(jerk, self.jerk_huber_delta).mean(dim=(1, 2, 3))
+        alim_pen = (violate**2).mean(dim=(2, 3))
+        acc_pen = _huber(accel, self.acc_huber_delta).mean(dim=(2, 3))
+        jerk_pen = _huber(jerk, self.jerk_huber_delta).mean(dim=(2, 3))
 
         # Gripper chattering: sign convention matches the policy binarization.
         grip_sign = torch.where(chunk[..., -1] > 0, 1.0, -1.0)  # [K, B, T]
         flips = (grip_sign[:, :, 1:] != grip_sign[:, :, :-1]).float().sum(dim=2)
-        flip_pen = torch.relu(flips - 1.0).mean(dim=1)
+        flip_pen = torch.relu(flips - 1.0)
 
         penalty = (
             self.w_alim * alim_pen
@@ -148,13 +156,13 @@ class ExecutabilityScorer:
             + self.w_acc * acc_pen
             + self.w_jerk * jerk_pen
         )
-        return {
-            "alim_pen": alim_pen.tolist(),
-            "acc_pen": acc_pen.tolist(),
-            "jerk_pen": jerk_pen.tolist(),
-            "flip_pen": flip_pen.tolist(),
-            "penalty": penalty.tolist(),
-        }
+        out = {}
+        out.update(_per_env_payload("alim_pen", alim_pen))
+        out.update(_per_env_payload("acc_pen", acc_pen))
+        out.update(_per_env_payload("jerk_pen", jerk_pen))
+        out.update(_per_env_payload("flip_pen", flip_pen))
+        out.update(_per_env_payload("penalty", penalty))
+        return out
 
 
 class ConsistencyScorer:
@@ -192,7 +200,7 @@ class ConsistencyScorer:
         self,
         env_actions: torch.Tensor,
         dream_videos: torch.Tensor,
-    ) -> dict[str, list[float]]:
+    ) -> dict[str, Any]:
         """Compute consistency penalties for K candidate chunks.
 
         Args:
@@ -201,9 +209,8 @@ class ConsistencyScorer:
                 IDM's split-canvas layout (V views, F frames).
 
         Returns:
-            Per-candidate lists (length K): ``cons_arm`` (standardized arm
-            SmoothL1), ``cons_grip`` (gripper sign-disagreement rate),
-            ``cons_penalty`` (weighted total).
+            ``*_per_env`` matrices shaped ``[K, B]``. For ``B == 1``, flat
+            per-candidate lists are also included for concise logging.
         """
         a_wam = torch.as_tensor(env_actions, dtype=torch.float32)
         if a_wam.ndim != 4:
@@ -223,18 +230,18 @@ class ConsistencyScorer:
         diff = (a_wam[..., :-1] - idm_act[..., :-1]) / arm_std
         arm = F.smooth_l1_loss(
             diff, torch.zeros_like(diff), beta=self.arm_beta, reduction="none"
-        ).mean(dim=(1, 2, 3))  # [K]
+        ).mean(dim=(2, 3))  # [K, B]
 
         a_grip = torch.where(a_wam[..., -1] > 0, 1.0, -1.0)
         i_grip = torch.where(idm_act[..., -1] > 0, 1.0, -1.0)
-        grip = (a_grip != i_grip).float().mean(dim=(1, 2))  # [K]
+        grip = (a_grip != i_grip).float().mean(dim=2)  # [K, B]
 
         penalty = self.w_arm * arm + self.w_grip * grip
-        return {
-            "cons_arm": arm.tolist(),
-            "cons_grip": grip.tolist(),
-            "cons_penalty": penalty.tolist(),
-        }
+        out = {}
+        out.update(_per_env_payload("cons_arm", arm))
+        out.update(_per_env_payload("cons_grip", grip))
+        out.update(_per_env_payload("cons_penalty", penalty))
+        return out
 
 
 class DreamZeroPRM:
@@ -295,7 +302,7 @@ class DreamZeroPRM:
                 w_grip=float(getattr(config, "bok_cons_grip_w", 1.0)),
             )
 
-    def _bounded(self, penalty: float) -> float:
+    def _bounded(self, penalty):
         """EVA bounded score: monotone-decreasing map penalty -> (0, SCORE_MAX].
 
         argmin of penalty == argmax of this score; using it lets the
@@ -308,7 +315,7 @@ class DreamZeroPRM:
         self,
         env_actions: torch.Tensor,
         context: Optional[dict] = None,
-    ) -> tuple[int, dict]:
+    ) -> tuple[Any, dict]:
         """Pick the candidate to execute.
 
         Args:
@@ -318,19 +325,23 @@ class DreamZeroPRM:
                 video here for the consistency term.
 
         Returns:
-            ``(chosen_index, info)`` where ``info`` holds the per-candidate
-            term breakdown, scores, and selection metadata for logging.
+            ``(chosen_index, info)`` where ``chosen_index`` is an ``int`` for
+            ``B == 1`` and a list of length ``B`` for parallel eval. ``info``
+            holds per-env matrices and selection metadata for logging. Flat
+            candidate lists are included only for ``B == 1``.
         """
         context = context or {}
         terms = self.exec_scorer.score(
             env_actions, prev_action=context.get("prev_action")
         )
-        exec_pen = terms["penalty"]
-        exec_score = [self._bounded(p) for p in exec_pen]
+        exec_pen_env = torch.as_tensor(terms["penalty_per_env"], dtype=torch.float32)
+        exec_score_env = self._bounded(exec_pen_env)
         info = dict(terms)
-        info["score"] = exec_score
-        info["exec_penalty"] = exec_pen
-        info["exec_score"] = exec_score
+        info["exec_score_per_env"] = exec_score_env.tolist()
+        if exec_score_env.shape[1] == 1:
+            info["score"] = exec_score_env[:, 0].tolist()
+            info["exec_penalty"] = terms["penalty"]
+            info["exec_score"] = info["score"]
 
         # Consistency arm: only when an IDM is loaded and the policy supplied
         # the decoded dreams. Selection then maximizes the lambda-weighted sum
@@ -338,18 +349,35 @@ class DreamZeroPRM:
         dreams = context.get("dream_videos")
         if self.cons_scorer is not None and dreams is not None:
             cons = self.cons_scorer.score(env_actions, dreams)
-            cons_score = [self._bounded(p) for p in cons["cons_penalty"]]
-            combined = [
-                self.exec_lambda * se + self.cons_lambda * sc
-                for se, sc in zip(exec_score, cons_score)
-            ]
-            chosen = int(max(range(len(combined)), key=combined.__getitem__))
+            cons_pen_env = torch.as_tensor(
+                cons["cons_penalty_per_env"], dtype=torch.float32
+            )
+            cons_score_env = self._bounded(cons_pen_env)
+            combined_env = self.exec_lambda * exec_score_env + (
+                self.cons_lambda * cons_score_env
+            )
+            chosen_tensor = torch.argmax(combined_env, dim=0)
+            chosen_per_env = chosen_tensor.cpu().tolist()
             info.update(cons)
-            info["cons_score"] = cons_score
-            info["combined_score"] = combined
+            info["cons_score_per_env"] = cons_score_env.tolist()
+            info["combined_score_per_env"] = combined_env.tolist()
+            if combined_env.shape[1] == 1:
+                info["cons_score"] = cons_score_env[:, 0].tolist()
+                info["combined_score"] = combined_env[:, 0].tolist()
+            info["chosen_index_per_env"] = chosen_per_env
+            info["chosen_counts"] = torch.bincount(
+                chosen_tensor.cpu(), minlength=exec_pen_env.shape[0]
+            ).tolist()
+            chosen = chosen_per_env[0] if len(chosen_per_env) == 1 else chosen_per_env
             info["chosen_index"] = chosen
             return chosen, info
 
-        chosen = int(min(range(len(exec_pen)), key=exec_pen.__getitem__))
+        chosen_tensor = torch.argmin(exec_pen_env, dim=0)
+        chosen_per_env = chosen_tensor.cpu().tolist()
+        info["chosen_index_per_env"] = chosen_per_env
+        info["chosen_counts"] = torch.bincount(
+            chosen_tensor.cpu(), minlength=exec_pen_env.shape[0]
+        ).tolist()
+        chosen = chosen_per_env[0] if len(chosen_per_env) == 1 else chosen_per_env
         info["chosen_index"] = chosen
         return chosen, info

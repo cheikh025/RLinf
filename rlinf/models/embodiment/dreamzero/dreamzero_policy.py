@@ -420,8 +420,13 @@ class DreamZeroPolicy(VLA, BasePolicy):
         chosen_index, select_info = self._select_candidate(
             env_actions, dream_frames if need_dreams else None
         )
+        selected_pred = self._gather_selected_candidate(candidates, chosen_index)
+
         # Last executed action, for the PRM's cross-chunk continuity term.
-        self._bok_prev_action = env_actions[chosen_index][:, -1, :].copy()
+        env_stack = np.stack(env_actions)  # [K, B, T, D]
+        chosen_per_env = self._chosen_per_env(chosen_index, env_stack.shape[1])
+        env_ids = np.arange(env_stack.shape[1])
+        self._bok_prev_action = env_stack[chosen_per_env, env_ids, -1, :].copy()
 
         self._log_best_of_k_diversity(
             candidates,
@@ -431,7 +436,7 @@ class DreamZeroPolicy(VLA, BasePolicy):
             chosen_index=chosen_index,
             select_info=select_info,
         )
-        return candidates[chosen_index]
+        return selected_pred
 
     def _cons_dreams_needed(self) -> bool:
         """Whether best-of-K must decode dreams this call for the consistency
@@ -446,9 +451,51 @@ class DreamZeroPolicy(VLA, BasePolicy):
             return False
         return bool(getattr(self.config, "bok_idm_model_path", None))
 
+    @staticmethod
+    def _chosen_per_env(chosen_index: Any, batch_size: int) -> np.ndarray:
+        """Normalize scalar/list PRM choices to one candidate id per env."""
+        chosen = np.asarray(chosen_index, dtype=np.int64)
+        if chosen.ndim == 0:
+            return np.full((batch_size,), int(chosen), dtype=np.int64)
+        chosen = chosen.reshape(-1)
+        if chosen.size != batch_size:
+            raise ValueError(
+                f"chosen_index has {chosen.size} entries but batch has {batch_size}"
+            )
+        return chosen
+
+    def _gather_selected_candidate(
+        self, candidates: list[dict[str, Any]], chosen_index: Any
+    ) -> dict[str, Any]:
+        """Build a model output dict with per-env best-of-K selections."""
+        first_action = candidates[0]["action_pred"]
+        batch_size = int(first_action.shape[0])
+        chosen_np = self._chosen_per_env(chosen_index, batch_size)
+
+        # Fast path: every env chose the same candidate.
+        if np.all(chosen_np == chosen_np[0]):
+            return candidates[int(chosen_np[0])]
+
+        out: dict[str, Any] = {}
+        env_choice = torch.as_tensor(
+            chosen_np, dtype=torch.long, device=first_action.device
+        )
+        for key, value in candidates[0].items():
+            if torch.is_tensor(value) and value.shape[:1] == (batch_size,):
+                stacked = torch.stack([cand[key] for cand in candidates], dim=0)
+                gather_idx = env_choice.view(
+                    1, batch_size, *([1] * (stacked.ndim - 2))
+                ).expand(1, batch_size, *stacked.shape[2:])
+                out[key] = stacked.gather(0, gather_idx).squeeze(0)
+            else:
+                # Non-batched metadata cannot be selected independently per env.
+                # Keep candidate 0's value; action_pred/video_pred are batched.
+                out[key] = value
+        return out
+
     def _select_candidate(
         self, env_actions: list, dream_frames: Optional[list] = None
-    ) -> tuple[int, Optional[dict]]:
+    ) -> tuple[Any, Optional[dict]]:
         """Pick which best-of-K candidate to execute.
 
         ``bok_selector`` (Hydra ``+actor.model.bok_selector``): "first"
@@ -488,29 +535,68 @@ class DreamZeroPolicy(VLA, BasePolicy):
                 [split_canvas(d) for d in dream_frames], dim=0
             )
         chosen, info = self._bok_prm.select(env_stack, context=context)
-        logger.info(
-            "[dreamzero best-of-k] call %d: selector=exec chose candidate %d "
-            "(exec_pen=%s, exec_score=%s, cons_pen=%s, cons_score=%s, combined=%s)",
-            self._bok_call_count,
-            chosen,
-            [round(p, 6) for p in info.get("exec_penalty", info["penalty"])],
-            [round(s, 6) for s in info.get("exec_score", info["score"])],
-            (
-                [round(p, 6) for p in info["cons_penalty"]]
-                if "cons_penalty" in info
-                else None
-            ),
-            (
-                [round(s, 6) for s in info["cons_score"]]
-                if "cons_score" in info
-                else None
-            ),
-            (
-                [round(s, 6) for s in info["combined_score"]]
-                if "combined_score" in info
-                else None
-            ),
-        )
+        chosen_per_env = info.get("chosen_index_per_env")
+        num_envs = len(chosen_per_env) if isinstance(chosen_per_env, list) else 1
+        if num_envs > 1:
+            logger.info(
+                "[dreamzero best-of-k] call %d: selector=exec chose per-env "
+                "candidates (num_envs=%d, chosen_counts=%s, "
+                "exec_pen_per_env_shape=%s, exec_score_per_env_shape=%s, "
+                "cons_pen_per_env_shape=%s, cons_score_per_env_shape=%s, "
+                "combined_per_env_shape=%s)",
+                self._bok_call_count,
+                num_envs,
+                info.get("chosen_counts"),
+                list(np.asarray(info["penalty_per_env"]).shape),
+                list(np.asarray(info["exec_score_per_env"]).shape),
+                (
+                    list(np.asarray(info["cons_penalty_per_env"]).shape)
+                    if "cons_penalty_per_env" in info
+                    else None
+                ),
+                (
+                    list(np.asarray(info["cons_score_per_env"]).shape)
+                    if "cons_score_per_env" in info
+                    else None
+                ),
+                (
+                    list(np.asarray(info["combined_score_per_env"]).shape)
+                    if "combined_score_per_env" in info
+                    else None
+                ),
+            )
+        else:
+            exec_pen = info.get("exec_penalty")
+            if exec_pen is None:
+                exec_pen = info.get("penalty", [])
+            exec_score = info.get("exec_score")
+            if exec_score is None:
+                exec_score = info.get("score", [])
+            logger.info(
+                "[dreamzero best-of-k] call %d: selector=exec chose candidate %s "
+                "(chosen_counts=%s, exec_pen=%s, exec_score=%s, cons_pen=%s, "
+                "cons_score=%s, combined=%s)",
+                self._bok_call_count,
+                chosen,
+                info.get("chosen_counts"),
+                [round(float(p), 6) for p in exec_pen],
+                [round(float(s), 6) for s in exec_score],
+                (
+                    [round(float(p), 6) for p in info["cons_penalty"]]
+                    if "cons_penalty" in info
+                    else None
+                ),
+                (
+                    [round(float(s), 6) for s in info["cons_score"]]
+                    if "cons_score" in info
+                    else None
+                ),
+                (
+                    [round(float(s), 6) for s in info["combined_score"]]
+                    if "combined_score" in info
+                    else None
+                ),
+            )
         return chosen, info
 
     def _log_best_of_k_diversity(
@@ -519,7 +605,7 @@ class DreamZeroPolicy(VLA, BasePolicy):
         seeds: list[int],
         mode: str,
         env_actions: list,
-        chosen_index: int = 0,
+        chosen_index: Any = 0,
         select_info: Optional[dict] = None,
     ) -> None:
         """Log and persist how different the K candidates are.
@@ -532,9 +618,10 @@ class DreamZeroPolicy(VLA, BasePolicy):
         width are training-masked padding with unconstrained values; it is
         only used as a bit-identical check (max pairwise L2 == 0 on the full
         output means seed variation had no effect) and a warning is logged.
-        Per-candidate env-space actions, the env-space distance matrix, the
-        chosen candidate, and (when the PRM selector ran) the per-candidate
-        PRM term breakdown are written to
+        Per-candidate env-space actions, the env-space distance matrix (flat
+        ``[K, K]`` only for ``B == 1``, otherwise ``[B, K, K]``), the chosen
+        candidate, and (when the PRM selector ran) the per-env PRM term
+        breakdown are written to
         ``<bok_output_dir>/best_of_k_info.jsonl``.
         """
         k = len(candidates)
@@ -543,44 +630,104 @@ class DreamZeroPolicy(VLA, BasePolicy):
         env_stack = torch.as_tensor(
             np.stack(env_actions), dtype=torch.float32
         )  # [K, B, T, env_dim]
-        env_flat = env_stack.reshape(k, -1)
-        env_dist = torch.cdist(env_flat, env_flat)  # [K, K]
+        num_envs = int(env_stack.shape[1])
         iu = torch.triu_indices(k, k, offset=1)
-        env_pairwise = env_dist[iu[0], iu[1]]
-        mean_l2 = env_pairwise.mean().item()
-        min_l2 = env_pairwise.min().item()
-        max_l2 = env_pairwise.max().item()
+        chosen_np = self._chosen_per_env(chosen_index, num_envs)
+        chosen_counts = (
+            select_info.get("chosen_counts") if select_info is not None else None
+        )
+        if chosen_counts is None:
+            chosen_counts = np.bincount(chosen_np, minlength=k).tolist()
 
         # Bit-identical check on the full model output (catches broken seeds
         # even if differences were only in padded dims).
-        raw = torch.stack(
+        raw_stack = torch.stack(
             [c["action_pred"].detach().float().cpu() for c in candidates]
-        ).reshape(k, -1)
-        raw_identical = torch.cdist(raw, raw)[iu[0], iu[1]].max().item() == 0.0
+        )
 
         call_index = self._bok_call_count
-        logger.info(
-            "[dreamzero best-of-k] call %d (%s): K=%d seeds=%s "
-            "env-action (%dd) pairwise L2 mean=%.4f min=%.4f max=%.4f",
-            call_index,
-            mode,
-            k,
-            seeds,
-            env_stack.shape[-1],
-            mean_l2,
-            min_l2,
-            max_l2,
-        )
+        if num_envs == 1:
+            env_flat = env_stack[:, 0].reshape(k, -1)
+            env_dist = torch.cdist(env_flat, env_flat)  # [K, K]
+            env_pairwise = env_dist[iu[0], iu[1]]
+            mean_l2 = env_pairwise.mean().item()
+            min_l2 = env_pairwise.min().item()
+            max_l2 = env_pairwise.max().item()
+
+            raw = raw_stack[:, 0].reshape(k, -1)
+            raw_identical = torch.cdist(raw, raw)[iu[0], iu[1]].max().item() == 0.0
+
+            logger.info(
+                "[dreamzero best-of-k] call %d (%s): K=%d seeds=%s "
+                "env-action (%dd) pairwise L2 mean=%.4f min=%.4f max=%.4f",
+                call_index,
+                mode,
+                k,
+                seeds,
+                env_stack.shape[-1],
+                mean_l2,
+                min_l2,
+                max_l2,
+            )
+            pairwise_info = {
+                "pairwise_l2_env": env_dist.tolist(),
+                "pairwise_l2_mean": mean_l2,
+                "pairwise_l2_min": min_l2,
+                "pairwise_l2_max": max_l2,
+                "identical": raw_identical,
+            }
+        else:
+            env_flat = env_stack.transpose(0, 1).contiguous().reshape(
+                num_envs, k, -1
+            )
+            env_dist = torch.cdist(env_flat, env_flat)  # [B, K, K]
+            env_pairwise = env_dist[:, iu[0], iu[1]]
+            zero_pair_envs = (env_pairwise.min(dim=1).values == 0.0).tolist()
+
+            raw = raw_stack.transpose(0, 1).contiguous().reshape(num_envs, k, -1)
+            raw_dist = torch.cdist(raw, raw)
+            raw_identical_envs = (
+                raw_dist[:, iu[0], iu[1]].max(dim=1).values == 0.0
+            ).tolist()
+            raw_identical = all(raw_identical_envs)
+
+            logger.info(
+                "[dreamzero best-of-k] call %d (%s): K=%d seeds=%s num_envs=%d "
+                "chosen_counts=%s env-action (%dd) pairwise L2 kept per-env "
+                "with shape=%s",
+                call_index,
+                mode,
+                k,
+                seeds,
+                num_envs,
+                chosen_counts,
+                env_stack.shape[-1],
+                list(env_dist.shape),
+            )
+            pairwise_info = {
+                "pairwise_l2_env_per_env": env_dist.tolist(),
+                "pairwise_l2_env_shape": list(env_dist.shape),
+                "identical": raw_identical,
+                "identical_per_env": raw_identical_envs,
+                "env_pairwise_has_zero_per_env": zero_pair_envs,
+            }
         if raw_identical:
             logger.warning(
                 "[dreamzero best-of-k] all %d candidates are bit-identical; "
                 "seed variation had no effect.",
                 k,
             )
-        elif min_l2 == 0.0:
+        elif num_envs == 1 and min_l2 == 0.0:
             logger.warning(
                 "[dreamzero best-of-k] at least one candidate pair has "
                 "identical env-space actions (min pairwise L2 = 0)."
+            )
+        elif num_envs > 1 and any(zero_pair_envs):
+            logger.warning(
+                "[dreamzero best-of-k] at least one candidate pair has "
+                "identical env-space actions in %d/%d envs.",
+                sum(bool(x) for x in zero_pair_envs),
+                num_envs,
             )
 
         output_dir = getattr(self.config, "bok_output_dir", "dreamzero_best_of_k")
@@ -591,14 +738,12 @@ class DreamZeroPolicy(VLA, BasePolicy):
             "k": k,
             "seeds": seeds,
             "env_action_shape": list(env_stack.shape[1:]),
-            "pairwise_l2_env": env_dist.tolist(),
-            "pairwise_l2_mean": mean_l2,
-            "pairwise_l2_min": min_l2,
-            "pairwise_l2_max": max_l2,
-            "identical": raw_identical,
             "chosen_index": chosen_index,
+            "chosen_index_per_env": chosen_np.tolist(),
+            "chosen_counts": chosen_counts,
             "env_actions_per_candidate": [np.asarray(a).tolist() for a in env_actions],
         }
+        info.update(pairwise_info)
         if select_info is not None:
             info["prm"] = select_info
         info_path = os.path.join(output_dir, "best_of_k_info.jsonl")
