@@ -67,6 +67,10 @@ class DreamZeroPolicy(VLA, BasePolicy):
         self._video_pred_call_count = 0
         # Counter for best-of-K candidate sampling (see _predict_best_of_k).
         self._bok_call_count = 0
+        # Lazily-built PRM selector and last executed env-space action
+        # (cross-chunk continuity term); see _select_candidate.
+        self._bok_prm = None
+        self._bok_prev_action = None
 
     # This method is called in FSDPModelManager.setup_model_and_optimizer
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs={}):
@@ -347,12 +351,17 @@ class DreamZeroPolicy(VLA, BasePolicy):
         resets the head's stream state (``current_start_frame``/KV caches) at
         the start of every call, so the K samplings are independent.
 
-        The executed result is always candidate 0; the other candidates are
-        only saved/logged for diversity verification (no scorer yet).
+        Which candidate is executed depends on ``bok_selector``: "first"
+        (default) always executes candidate 0 (baseline behavior); "exec"
+        delegates to the executability PRM (see
+        ``rlinf.models.embodiment.dreamzero.prm`` and ``_select_candidate``).
+        All candidates are saved/logged for diversity verification.
 
         Enabled with ``actor.model.best_of_k`` > 1. Optional:
         ``bok_base_seed`` (default: the head's own seed), ``bok_output_dir``
-        (default "dreamzero_best_of_k") for the diversity jsonl.
+        (default "dreamzero_best_of_k") for the diversity jsonl,
+        ``bok_selector`` and the ``bok_select_margin`` / ``bok_exec_w_*``
+        PRM knobs.
         """
         action_head = self.action_head
         if not hasattr(action_head, "seed"):
@@ -385,30 +394,8 @@ class DreamZeroPolicy(VLA, BasePolicy):
         finally:
             action_head.seed = original_seed
 
-        self._log_best_of_k_diversity(candidates, seeds, mode=mode, obs=obs)
-        return candidates[0]
-
-    def _log_best_of_k_diversity(
-        self,
-        candidates: list,
-        seeds: list[int],
-        mode: str,
-        obs: dict,
-    ) -> None:
-        """Log and persist how different the K candidates are.
-
-        Diversity is measured on the **env-space actions** (un-normalized via
-        ``unapply``, before gripper binarization): pairwise L2 over flattened
-        chunks of the real environment dims (e.g. 7 for LIBERO). The raw
-        32-wide ``action_pred`` is NOT used for stats because dims beyond the
-        env width are training-masked padding with unconstrained values; it
-        is only used as a bit-identical check (max pairwise L2 == 0 on the
-        full output means seed variation had no effect) and a warning is
-        logged. Per-candidate env-space actions and the env-space distance
-        matrix are written to ``<bok_output_dir>/best_of_k_info.jsonl``.
-        """
-        k = len(candidates)
-
+        # Env-space actions per candidate (the real env dims; computed once,
+        # used for selection and for diversity logging).
         env_actions = []
         for cand in candidates:
             cand_batch = self.unapply(
@@ -416,6 +403,82 @@ class DreamZeroPolicy(VLA, BasePolicy):
                 obs=obs,
             )
             env_actions.append(np.asarray(self._actions_from_unapply(cand_batch.act)))
+
+        chosen_index, select_info = self._select_candidate(env_actions)
+        # Last executed action, for the PRM's cross-chunk continuity term.
+        self._bok_prev_action = env_actions[chosen_index][:, -1, :].copy()
+
+        self._log_best_of_k_diversity(
+            candidates,
+            seeds,
+            mode=mode,
+            env_actions=env_actions,
+            chosen_index=chosen_index,
+            select_info=select_info,
+        )
+        return candidates[chosen_index]
+
+    def _select_candidate(self, env_actions: list) -> tuple[int, Optional[dict]]:
+        """Pick which best-of-K candidate to execute.
+
+        ``bok_selector`` (Hydra ``+actor.model.bok_selector``): "first"
+        (default) always executes candidate 0 — exact baseline behavior;
+        "exec" ranks candidates with the executability PRM
+        (:class:`rlinf.models.embodiment.dreamzero.prm.DreamZeroPRM`),
+        passing the previous executed action for the cross-chunk seam term.
+        """
+        selector = str(getattr(self.config, "bok_selector", "first") or "first")
+        selector = selector.lower()
+        if selector == "first":
+            return 0, None
+        if selector != "exec":
+            raise ValueError(
+                f"Unknown bok_selector {selector!r}; use 'first' or 'exec'."
+            )
+        if self._bok_prm is None:
+            from rlinf.models.embodiment.dreamzero.prm import DreamZeroPRM
+
+            self._bok_prm = DreamZeroPRM(self.config)
+        env_stack = torch.as_tensor(np.stack(env_actions), dtype=torch.float32)
+        context = {}
+        if self._bok_prev_action is not None:
+            context["prev_action"] = self._bok_prev_action
+        chosen, info = self._bok_prm.select(env_stack, context=context)
+        logger.info(
+            "[dreamzero best-of-k] call %d: selector=exec chose candidate %d "
+            "(penalties=%s, margin_vs_cand0=%.6f)",
+            self._bok_call_count,
+            chosen,
+            [round(p, 6) for p in info["penalty"]],
+            info["margin_vs_cand0"],
+        )
+        return chosen, info
+
+    def _log_best_of_k_diversity(
+        self,
+        candidates: list,
+        seeds: list[int],
+        mode: str,
+        env_actions: list,
+        chosen_index: int = 0,
+        select_info: Optional[dict] = None,
+    ) -> None:
+        """Log and persist how different the K candidates are.
+
+        Diversity is measured on the **env-space actions** (un-normalized via
+        ``unapply``, before gripper binarization, precomputed by
+        ``_predict_best_of_k``): pairwise L2 over flattened chunks of the
+        real environment dims (e.g. 7 for LIBERO). The raw 32-wide
+        ``action_pred`` is NOT used for stats because dims beyond the env
+        width are training-masked padding with unconstrained values; it is
+        only used as a bit-identical check (max pairwise L2 == 0 on the full
+        output means seed variation had no effect) and a warning is logged.
+        Per-candidate env-space actions, the env-space distance matrix, the
+        chosen candidate, and (when the PRM selector ran) the per-candidate
+        PRM term breakdown are written to
+        ``<bok_output_dir>/best_of_k_info.jsonl``.
+        """
+        k = len(candidates)
 
         # Stats on the real env dims only (padding dims are meaningless).
         env_stack = torch.as_tensor(
@@ -474,8 +537,11 @@ class DreamZeroPolicy(VLA, BasePolicy):
             "pairwise_l2_min": min_l2,
             "pairwise_l2_max": max_l2,
             "identical": raw_identical,
-            "env_actions_per_candidate": [a.tolist() for a in env_actions],
+            "chosen_index": chosen_index,
+            "env_actions_per_candidate": [np.asarray(a).tolist() for a in env_actions],
         }
+        if select_info is not None:
+            info["prm"] = select_info
         info_path = os.path.join(output_dir, "best_of_k_info.jsonl")
         with open(info_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(info) + "\n")
