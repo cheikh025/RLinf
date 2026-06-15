@@ -52,6 +52,10 @@ from rlinf.models.embodiment.dreamzero.idm.model import (
     compute_loss,
     count_parameters,
 )
+from rlinf.models.embodiment.dreamzero.idm.vae_roundtrip import (
+    RoundtripPrefetcher,
+    VaeRoundtrip,
+)
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -93,6 +97,31 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument("--video-backend", default="pyav")
     p.add_argument("--device", default="cuda")
+    p.add_argument(
+        "--vae-roundtrip",
+        action="store_true",
+        help=(
+            "On-the-fly WAN-VAE decode(encode()) of training frames so the IDM "
+            "trains on the dream-domain artifact distribution it sees at "
+            "inference (domain-gap mitigation). Overlapped on a side CUDA "
+            "stream; no disk cost."
+        ),
+    )
+    p.add_argument(
+        "--vae-path",
+        default=None,
+        help="Path to Wan2.2_VAE.pth (z_dim=48); required with --vae-roundtrip.",
+    )
+    p.add_argument(
+        "--vae-roundtrip-prob",
+        type=float,
+        default=1.0,
+        help=(
+            "Fraction of batches to roundtrip (1.0 = every batch). <1 keeps "
+            "some clean frames for real-frame accuracy; this is a modeling "
+            "knob, not a memory one."
+        ),
+    )
     p.add_argument(
         "--resume", type=Path, default=None, help="Checkpoint to resume from."
     )
@@ -312,9 +341,21 @@ def main() -> None:
             path,
         )
 
+    roundtrip = None
+    if args.vae_roundtrip:
+        if not args.vae_path:
+            raise ValueError("--vae-roundtrip requires --vae-path (Wan2.2_VAE.pth).")
+        roundtrip = VaeRoundtrip(args.vae_path, device=device)
+        print(
+            f"VAE roundtrip enabled: prob={args.vae_roundtrip_prob} path={args.vae_path}"
+        )
+    prefetcher = RoundtripPrefetcher(
+        train_loader, roundtrip, device, prob=args.vae_roundtrip_prob
+    )
+
     best_val = float("inf")
     step = start_step
-    train_iter = iter(train_loader)
+    data_iter = iter(prefetcher)
     t0 = time.time()
     running_loss = 0.0
     running_n = 0
@@ -322,13 +363,10 @@ def main() -> None:
 
     while step < args.steps:
         try:
-            batch = next(train_iter)
+            video, target = next(data_iter)
         except StopIteration:
-            train_iter = iter(train_loader)
-            batch = next(train_iter)
-
-        video = batch["video"].to(device, non_blocking=True)
-        target = batch["actions"].to(device, non_blocking=True)
+            data_iter = iter(prefetcher)
+            video, target = next(data_iter)
 
         lr = lr_at(step, args.lr, args.warmup_steps, args.steps)
         for g in optim.param_groups:
