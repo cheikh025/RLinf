@@ -25,6 +25,7 @@ policy. Design and verified constants:
 from typing import Any, Optional
 
 import torch
+import torch.nn.functional as F
 
 # Hard per-step acceleration bounds in normalized action units, derived from
 # Franka Panda rate limits (libfranka rate_limiting.h: 13 m/s^2 translational,
@@ -156,22 +157,109 @@ class ExecutabilityScorer:
         }
 
 
+class ConsistencyScorer:
+    """Cycle-consistency term (Milestone 3): does the WAM's action chunk agree
+    with a frozen IDM's reading of the WAM's own dreamed video?
+
+    For each best-of-K candidate, the IDM -- trained to invert a dreamed clip
+    back to the action chunk that produced it -- predicts actions from the
+    decoded dream; the penalty is the distance to the WAM's predicted actions
+    on the 7 env dims: arm SmoothL1 in the IDM's *standardized* units (so
+    translation does not drown rotation) plus gripper sign disagreement. Low
+    penalty = video and actions tell the same story (internally coherent); a
+    high penalty flags a candidate whose two heads disagree.
+
+    Needs no ground truth and no simulator -- computed purely from the model's
+    own outputs, exploiting DreamZero's joint video+action structure. The IDM
+    is loaded once (see :meth:`IDM.from_checkpoint`) and passed in.
+    """
+
+    def __init__(
+        self,
+        idm,
+        w_arm: float = 1.0,
+        w_grip: float = 1.0,
+        arm_beta: float = 0.1,
+    ):
+        self.idm = idm
+        self.device = next(idm.parameters()).device
+        self.w_arm = float(w_arm)
+        self.w_grip = float(w_grip)
+        self.arm_beta = float(arm_beta)
+
+    @torch.no_grad()
+    def score(
+        self,
+        env_actions: torch.Tensor,
+        dream_videos: torch.Tensor,
+    ) -> dict[str, list[float]]:
+        """Compute consistency penalties for K candidate chunks.
+
+        Args:
+            env_actions: ``[K, B, T, D]`` env-space WAM actions (gripper last).
+            dream_videos: ``[K, B, V, F, 3, H, W]`` uint8 decoded dreams in the
+                IDM's split-canvas layout (V views, F frames).
+
+        Returns:
+            Per-candidate lists (length K): ``cons_arm`` (standardized arm
+            SmoothL1), ``cons_grip`` (gripper sign-disagreement rate),
+            ``cons_penalty`` (weighted total).
+        """
+        a_wam = torch.as_tensor(env_actions, dtype=torch.float32)
+        if a_wam.ndim != 4:
+            raise ValueError(f"env_actions must be [K, B, T, D], got {a_wam.shape}")
+        k, b, t, d = a_wam.shape
+
+        vids = torch.as_tensor(dream_videos)
+        if tuple(vids.shape[:2]) != (k, b):
+            raise ValueError(
+                f"dream_videos must start [K={k}, B={b}, ...], got {tuple(vids.shape)}"
+            )
+        # One batched IDM forward over all K*B clips, then back to [K, B, T, D].
+        idm_in = vids.reshape(k * b, *vids.shape[2:]).to(self.device)
+        idm_act = self.idm.predict(idm_in).reshape(k, b, t, d).float().cpu()
+
+        arm_std = self.idm.arm_std.detach().float().cpu().clamp_min(1e-6)
+        diff = (a_wam[..., :-1] - idm_act[..., :-1]) / arm_std
+        arm = F.smooth_l1_loss(
+            diff, torch.zeros_like(diff), beta=self.arm_beta, reduction="none"
+        ).mean(dim=(1, 2, 3))  # [K]
+
+        a_grip = torch.where(a_wam[..., -1] > 0, 1.0, -1.0)
+        i_grip = torch.where(idm_act[..., -1] > 0, 1.0, -1.0)
+        grip = (a_grip != i_grip).float().mean(dim=(1, 2))  # [K]
+
+        penalty = self.w_arm * arm + self.w_grip * grip
+        return {
+            "cons_arm": arm.tolist(),
+            "cons_grip": grip.tolist(),
+            "cons_penalty": penalty.tolist(),
+        }
+
+
 class DreamZeroPRM:
     """Combine PRM terms and select which best-of-K candidate to execute.
 
-    Today this wraps only :class:`ExecutabilityScorer`; the cycle-consistency
-    term (Milestone 3, frozen IDM on the dreamed video) will be added here
-    and fed through ``context`` -- the policy-side hook does not change.
+    Always scores executability (:class:`ExecutabilityScorer`). When an IDM
+    checkpoint is configured (``bok_idm_model_path``) *and* the policy passes
+    the decoded dreams in ``context["dream_videos"]``, the cycle-consistency
+    term (:class:`ConsistencyScorer`) is added and the two are combined as
+    ``exec_lambda * exec_score + cons_lambda * cons_score`` on the bounded
+    (0, SCORE_MAX] axis. Without an IDM (or without dreams) it is pure
+    executability and behaves exactly as before.
 
-    Selection: ``argmin`` of the total penalty with a tie-break toward
-    candidate 0 (the baseline seed): candidate ``k != 0`` is chosen only if
-    it beats candidate 0 by more than ``select_margin``, so selection
-    deviates from baseline behavior only on a real preference.
+    Selection: pick the best candidate (``argmin`` penalty for exec-only,
+    ``argmax`` combined score when consistency is on) with a tie-break toward
+    candidate 0 (the baseline seed): candidate ``k != 0`` is chosen only if it
+    beats candidate 0 by more than ``select_margin``, so selection deviates
+    from baseline behavior only on a real preference.
 
     Config (read via ``getattr`` from the policy's ``DreamZeroConfig``, all
     optional Hydra ``+actor.model.*`` keys): ``bok_select_margin``,
     ``bok_exec_w_alim``, ``bok_exec_w_grip``, ``bok_exec_w_acc``,
-    ``bok_exec_w_jerk``.
+    ``bok_exec_w_jerk``; and for consistency ``bok_idm_model_path``,
+    ``bok_idm_device``, ``bok_exec_lambda``, ``bok_cons_lambda``,
+    ``bok_cons_arm_w``, ``bok_cons_grip_w``.
     """
 
     #: EVA's bounded score mapping (logged only; argmin of penalty is the
@@ -189,6 +277,35 @@ class DreamZeroPRM:
             w_acc=float(getattr(config, "bok_exec_w_acc", 0.1)),
             w_jerk=float(getattr(config, "bok_exec_w_jerk", 0.05)),
         )
+        # Optional cycle-consistency term (Milestone 3). Built only when an IDM
+        # checkpoint is configured (``bok_idm_model_path``), so executability-
+        # only runs load no IDM and behave exactly as before.
+        self.cons_scorer = None
+        self.exec_lambda = float(getattr(config, "bok_exec_lambda", 1.0))
+        self.cons_lambda = float(getattr(config, "bok_cons_lambda", 1.0))
+        idm_path = getattr(config, "bok_idm_model_path", None)
+        if idm_path:
+            from rlinf.models.embodiment.dreamzero.idm.model import IDM
+
+            idm = IDM.from_checkpoint(
+                str(idm_path),
+                device=str(getattr(config, "bok_idm_device", "cuda")),
+                dtype=torch.float32,
+            )
+            self.cons_scorer = ConsistencyScorer(
+                idm,
+                w_arm=float(getattr(config, "bok_cons_arm_w", 1.0)),
+                w_grip=float(getattr(config, "bok_cons_grip_w", 1.0)),
+            )
+
+    def _bounded(self, penalty: float) -> float:
+        """EVA bounded score: monotone-decreasing map penalty -> (0, SCORE_MAX].
+
+        argmin of penalty == argmax of this score; using it lets the
+        executability and consistency penalties (different raw scales) be
+        combined on one comparable (0, SCORE_MAX] axis with the lambda weights.
+        """
+        return self.SCORE_MAX * (1.0 + penalty / self.SCORE_P0) ** (-self.SCORE_GAMMA)
 
     def select(
         self,
@@ -211,17 +328,37 @@ class DreamZeroPRM:
         terms = self.exec_scorer.score(
             env_actions, prev_action=context.get("prev_action")
         )
-        penalty = terms["penalty"]
-        chosen = int(min(range(len(penalty)), key=penalty.__getitem__))
-        margin_vs_cand0 = penalty[0] - penalty[chosen]
+        exec_pen = terms["penalty"]
+        exec_score = [self._bounded(p) for p in exec_pen]
+        info = dict(terms)
+        info["score"] = exec_score
+
+        # Consistency arm: only when an IDM is loaded and the policy supplied
+        # the decoded dreams. Selection then maximizes the lambda-weighted sum
+        # of the bounded executability and consistency scores.
+        dreams = context.get("dream_videos")
+        if self.cons_scorer is not None and dreams is not None:
+            cons = self.cons_scorer.score(env_actions, dreams)
+            cons_score = [self._bounded(p) for p in cons["cons_penalty"]]
+            combined = [
+                self.exec_lambda * se + self.cons_lambda * sc
+                for se, sc in zip(exec_score, cons_score)
+            ]
+            chosen = int(max(range(len(combined)), key=combined.__getitem__))
+            margin_vs_cand0 = combined[chosen] - combined[0]
+            if chosen != 0 and margin_vs_cand0 <= self.select_margin:
+                chosen = 0
+            info.update(cons)
+            info["cons_score"] = cons_score
+            info["combined_score"] = combined
+            info["chosen_index"] = chosen
+            info["margin_vs_cand0"] = margin_vs_cand0
+            return chosen, info
+
+        chosen = int(min(range(len(exec_pen)), key=exec_pen.__getitem__))
+        margin_vs_cand0 = exec_pen[0] - exec_pen[chosen]
         if chosen != 0 and margin_vs_cand0 <= self.select_margin:
             chosen = 0
-        scores = [
-            self.SCORE_MAX * (1.0 + p / self.SCORE_P0) ** (-self.SCORE_GAMMA)
-            for p in penalty
-        ]
-        info = dict(terms)
-        info["score"] = scores
         info["chosen_index"] = chosen
         info["margin_vs_cand0"] = margin_vs_cand0
         return chosen, info

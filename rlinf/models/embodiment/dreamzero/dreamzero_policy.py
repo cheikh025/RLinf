@@ -373,8 +373,10 @@ class DreamZeroPolicy(VLA, BasePolicy):
         base_seed = getattr(self.config, "bok_base_seed", None)
         base_seed = original_seed if base_seed is None else int(base_seed)
 
+        need_dreams = self._cons_dreams_needed()
         candidates = []
         seeds = []
+        dream_frames = []
         try:
             for k in range(num_candidates):
                 seed = base_seed + k
@@ -383,13 +385,25 @@ class DreamZeroPolicy(VLA, BasePolicy):
                     pred = self.lazy_joint_video_action_causal(normalized_input)
                 candidates.append(pred)
                 seeds.append(seed)
+                video_pred = pred.get("video_pred")
+                # Decode the dream once when consistency needs it (always-on,
+                # not gated by save_video_pred); reuse it for saving so a
+                # save+consistency run never decodes the same chunk twice.
+                decoded = (
+                    self._decode_dream(video_pred)
+                    if (need_dreams and video_pred is not None)
+                    else None
+                )
+                if decoded is not None:
+                    dream_frames.append(decoded)
                 self._maybe_save_video_pred(
-                    pred.get("video_pred"),
+                    video_pred,
                     mode=mode,
                     input_images=normalized_input.get("images") if k == 0 else None,
                     candidate_index=k,
                     seed=seed,
                     increment_call=(k == num_candidates - 1),
+                    decoded=decoded,
                 )
         finally:
             action_head.seed = original_seed
@@ -404,7 +418,9 @@ class DreamZeroPolicy(VLA, BasePolicy):
             )
             env_actions.append(np.asarray(self._actions_from_unapply(cand_batch.act)))
 
-        chosen_index, select_info = self._select_candidate(env_actions)
+        chosen_index, select_info = self._select_candidate(
+            env_actions, dream_frames if need_dreams else None
+        )
         # Last executed action, for the PRM's cross-chunk continuity term.
         self._bok_prev_action = env_actions[chosen_index][:, -1, :].copy()
 
@@ -418,14 +434,35 @@ class DreamZeroPolicy(VLA, BasePolicy):
         )
         return candidates[chosen_index]
 
-    def _select_candidate(self, env_actions: list) -> tuple[int, Optional[dict]]:
+    def _cons_dreams_needed(self) -> bool:
+        """Whether best-of-K must decode dreams this call for the consistency
+        term: only when the exec selector is active and an IDM checkpoint is
+        configured (``bok_idm_model_path``). Independent of ``save_video_pred``
+        -- the consistency decode is always-on, the save decode is capped.
+        """
+        selector = str(
+            getattr(self.config, "bok_selector", "first") or "first"
+        ).lower()
+        if selector != "exec":
+            return False
+        return bool(getattr(self.config, "bok_idm_model_path", None))
+
+    def _select_candidate(
+        self, env_actions: list, dream_frames: Optional[list] = None
+    ) -> tuple[int, Optional[dict]]:
         """Pick which best-of-K candidate to execute.
 
         ``bok_selector`` (Hydra ``+actor.model.bok_selector``): "first"
         (default) always executes candidate 0 — exact baseline behavior;
-        "exec" ranks candidates with the executability PRM
+        "exec" ranks candidates with the PRM
         (:class:`rlinf.models.embodiment.dreamzero.prm.DreamZeroPRM`),
         passing the previous executed action for the cross-chunk seam term.
+
+        When an IDM checkpoint is configured (``bok_idm_model_path``), the PRM
+        also scores cycle-consistency; ``dream_frames`` (the per-candidate
+        decoded RGB canvases from ``_decode_dream``) are split into the IDM's
+        per-view layout and passed in ``context["dream_videos"]``. Without an
+        IDM, ``dream_frames`` is ``None`` and selection is executability-only.
         """
         selector = str(getattr(self.config, "bok_selector", "first") or "first")
         selector = selector.lower()
@@ -443,6 +480,14 @@ class DreamZeroPolicy(VLA, BasePolicy):
         context = {}
         if self._bok_prev_action is not None:
             context["prev_action"] = self._bok_prev_action
+        # Consistency term: split each decoded dream canvas into the IDM's
+        # per-view layout and stack to [K, B, V, F, 3, H, W/2].
+        if self._bok_prm.cons_scorer is not None and dream_frames:
+            from rlinf.models.embodiment.dreamzero.idm.model import split_canvas
+
+            context["dream_videos"] = torch.stack(
+                [split_canvas(d) for d in dream_frames], dim=0
+            )
         chosen, info = self._bok_prm.select(env_stack, context=context)
         logger.info(
             "[dreamzero best-of-k] call %d: selector=exec chose candidate %d "
@@ -547,6 +592,37 @@ class DreamZeroPolicy(VLA, BasePolicy):
             f.write(json.dumps(info) + "\n")
         self._bok_call_count += 1
 
+    @torch.no_grad()
+    def _decode_dream(self, video_pred: torch.Tensor) -> torch.Tensor:
+        """Decode a WAN video latent to RGB dream frames (no gating).
+
+        ``video_pred`` is the ``[B, C, T, H, W]`` latent from
+        ``lazy_joint_video_action_causal``; returns uint8 ``[B, T, H, W, 3]``
+        with the same recipe/normalization as the save hook and the IDM canvas.
+
+        This is the **always-on** decode used by the consistency PRM term:
+        unlike ``_maybe_save_video_pred`` it is never gated by
+        ``save_video_pred`` or capped by ``video_pred_max_calls`` -- the
+        selector needs every candidate's dream on every call. The save hook
+        reuses this result so a save+consistency run never decodes a chunk
+        twice.
+        """
+        action_head = self.action_head
+        frames = action_head.vae.decode(
+            video_pred,
+            tiled=action_head.tiled,
+            tile_size=(
+                action_head.tile_size_height,
+                action_head.tile_size_width,
+            ),
+            tile_stride=(
+                action_head.tile_stride_height,
+                action_head.tile_stride_width,
+            ),
+        )
+        rgb = rearrange(frames, "B C T H W -> B T H W C")
+        return ((rgb.float() + 1) * 127.5).clip(0, 255).to(torch.uint8)
+
     def _maybe_save_video_pred(
         self,
         video_pred: Optional[torch.Tensor],
@@ -555,6 +631,7 @@ class DreamZeroPolicy(VLA, BasePolicy):
         candidate_index: Optional[int] = None,
         seed: Optional[int] = None,
         increment_call: bool = True,
+        decoded: Optional[torch.Tensor] = None,
     ) -> None:
         """Decode and save DreamZero's dreamed video chunk as MP4 (debug only).
 
@@ -609,27 +686,25 @@ class DreamZeroPolicy(VLA, BasePolicy):
             tuple(video_pred.shape),
         )
 
-        action_head = self.action_head
-        with torch.no_grad():
-            frames = action_head.vae.decode(
-                video_pred,
-                tiled=action_head.tiled,
-                tile_size=(
-                    action_head.tile_size_height,
-                    action_head.tile_size_width,
-                ),
-                tile_stride=(
-                    action_head.tile_stride_height,
-                    action_head.tile_stride_width,
-                ),
-            )
+        # Reuse the consistency decode if the caller already produced it;
+        # otherwise decode here (this path is gated above by save_video_pred /
+        # video_pred_max_calls, so it stays a capped debug decode).
+        if decoded is None:
+            decoded = self._decode_dream(video_pred)
+        rgb = decoded.cpu().numpy()  # [B, T, H, W, 3] uint8
+        # Decoded B C T H W shape, reconstructed from the RGB tensor for the
+        # debug log / jsonl (matches the previous vae.decode output shape).
+        decoded_shape = [
+            rgb.shape[0],
+            rgb.shape[4],
+            rgb.shape[1],
+            rgb.shape[2],
+            rgb.shape[3],
+        ]
         logger.info(
             "[dreamzero video debug] decoded frames B C T H W shape = %s",
-            tuple(frames.shape),
+            tuple(decoded_shape),
         )
-
-        rgb = rearrange(frames, "B C T H W -> B T H W C")
-        rgb = ((rgb.float() + 1) * 127.5).clip(0, 255).cpu().numpy().astype(np.uint8)
         logger.info(
             "[dreamzero video debug] decoded RGB B T H W C shape = %s", rgb.shape
         )
@@ -649,7 +724,7 @@ class DreamZeroPolicy(VLA, BasePolicy):
                 "env_index": env_idx,
                 "mp4_path": mp4_path,
                 "latent_shape": list(video_pred.shape),
-                "decoded_shape": list(frames.shape),
+                "decoded_shape": decoded_shape,
                 "num_frames": int(rgb.shape[1]),
                 "height": int(rgb.shape[2]),
                 "width": int(rgb.shape[3]),

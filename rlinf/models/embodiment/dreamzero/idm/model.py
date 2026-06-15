@@ -280,6 +280,47 @@ class IDM(nn.Module):
         grip = torch.where(out["gripper_logit"] > 0, 1.0, -1.0).unsqueeze(-1)
         return torch.cat([arm, grip], dim=-1)
 
+    @classmethod
+    def from_checkpoint(
+        cls,
+        path: str,
+        device: str = "cuda",
+        dtype: torch.dtype = torch.float32,
+    ) -> "IDM":
+        """Load a trained IDM from a checkpoint directory or ``.pt`` file.
+
+        ``path`` may be a directory written by ``idm/train.py`` (picks
+        ``best.pt`` > ``final.pt`` > ``latest.pt``) or a direct ``.pt`` file.
+        The checkpoint carries ``idm_cfg`` and the model ``state_dict``
+        including the standardization buffers (``arm_mean`` / ``arm_std``), so
+        no side files or :meth:`set_action_stats` call is needed at load time.
+        Returned frozen and in eval mode; defaults to fp32 since
+        :meth:`forward` floats its input (run under autocast for bf16).
+        """
+        import os
+
+        ckpt_path = path
+        if os.path.isdir(path):
+            for name in ("best.pt", "final.pt", "latest.pt"):
+                candidate = os.path.join(path, name)
+                if os.path.isfile(candidate):
+                    ckpt_path = candidate
+                    break
+            else:
+                raise FileNotFoundError(
+                    f"No best.pt/final.pt/latest.pt in IDM checkpoint dir {path!r}"
+                )
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        if "idm_cfg" not in ckpt or "model" not in ckpt:
+            raise KeyError(
+                f"IDM checkpoint {ckpt_path!r} missing 'idm_cfg'/'model'; "
+                "expected a checkpoint saved by idm/train.py."
+            )
+        cfg = IDMConfig(**ckpt["idm_cfg"])
+        model = cls(cfg)
+        model.load_state_dict(ckpt["model"])
+        return model.eval().to(device=device, dtype=dtype).requires_grad_(False)
+
 
 def compute_loss(
     outputs: dict[str, torch.Tensor],
