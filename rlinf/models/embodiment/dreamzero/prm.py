@@ -248,18 +248,16 @@ class DreamZeroPRM:
     (0, SCORE_MAX] axis. Without an IDM (or without dreams) it is pure
     executability and behaves exactly as before.
 
-    Selection: pick the best candidate (``argmin`` penalty for exec-only,
-    ``argmax`` combined score when consistency is on) with a tie-break toward
-    candidate 0 (the baseline seed): candidate ``k != 0`` is chosen only if it
-    beats candidate 0 by more than ``select_margin``, so selection deviates
-    from baseline behavior only on a real preference.
+    Selection: pick the best candidate directly (``argmin`` penalty for
+    exec-only, ``argmax`` combined score when consistency is on). Candidate 0
+    has no special tie-break privilege in best-of-K mode.
 
     Config (read via ``getattr`` from the policy's ``DreamZeroConfig``, all
-    optional Hydra ``+actor.model.*`` keys): ``bok_select_margin``,
-    ``bok_exec_w_alim``, ``bok_exec_w_grip``, ``bok_exec_w_acc``,
-    ``bok_exec_w_jerk``; and for consistency ``bok_idm_model_path``,
-    ``bok_idm_device``, ``bok_exec_lambda``, ``bok_cons_lambda``,
-    ``bok_cons_arm_w``, ``bok_cons_grip_w``.
+    optional Hydra ``+actor.model.*`` keys): ``bok_exec_w_alim``,
+    ``bok_exec_w_grip``, ``bok_exec_w_acc``, ``bok_exec_w_jerk``; and for
+    consistency ``bok_idm_model_path``, ``bok_idm_device``,
+    ``bok_exec_lambda``, ``bok_cons_lambda``, ``bok_cons_arm_w``,
+    ``bok_cons_grip_w``.
     """
 
     #: EVA's bounded score mapping (logged only; argmin of penalty is the
@@ -270,7 +268,6 @@ class DreamZeroPRM:
     SCORE_GAMMA = 0.5
 
     def __init__(self, config: Any = None):
-        self.select_margin = float(getattr(config, "bok_select_margin", 0.0) or 0.0)
         self.exec_scorer = ExecutabilityScorer(
             w_alim=float(getattr(config, "bok_exec_w_alim", 1.0)),
             w_grip=float(getattr(config, "bok_exec_w_grip", 1.0)),
@@ -332,6 +329,8 @@ class DreamZeroPRM:
         exec_score = [self._bounded(p) for p in exec_pen]
         info = dict(terms)
         info["score"] = exec_score
+        info["exec_penalty"] = exec_pen
+        info["exec_score"] = exec_score
 
         # Consistency arm: only when an IDM is loaded and the policy supplied
         # the decoded dreams. Selection then maximizes the lambda-weighted sum
@@ -345,20 +344,12 @@ class DreamZeroPRM:
                 for se, sc in zip(exec_score, cons_score)
             ]
             chosen = int(max(range(len(combined)), key=combined.__getitem__))
-            margin_vs_cand0 = combined[chosen] - combined[0]
-            if chosen != 0 and margin_vs_cand0 <= self.select_margin:
-                chosen = 0
             info.update(cons)
             info["cons_score"] = cons_score
             info["combined_score"] = combined
             info["chosen_index"] = chosen
-            info["margin_vs_cand0"] = margin_vs_cand0
             return chosen, info
 
         chosen = int(min(range(len(exec_pen)), key=exec_pen.__getitem__))
-        margin_vs_cand0 = exec_pen[0] - exec_pen[chosen]
-        if chosen != 0 and margin_vs_cand0 <= self.select_margin:
-            chosen = 0
         info["chosen_index"] = chosen
-        info["margin_vs_cand0"] = margin_vs_cand0
         return chosen, info

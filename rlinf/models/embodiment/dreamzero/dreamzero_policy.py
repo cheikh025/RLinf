@@ -360,8 +360,7 @@ class DreamZeroPolicy(VLA, BasePolicy):
         Enabled with ``actor.model.best_of_k`` > 1. Optional:
         ``bok_base_seed`` (default: the head's own seed), ``bok_output_dir``
         (default "dreamzero_best_of_k") for the diversity jsonl,
-        ``bok_selector`` and the ``bok_select_margin`` / ``bok_exec_w_*``
-        PRM knobs.
+        ``bok_selector`` and the ``bok_exec_w_*`` PRM knobs.
         """
         action_head = self.action_head
         if not hasattr(action_head, "seed"):
@@ -491,11 +490,26 @@ class DreamZeroPolicy(VLA, BasePolicy):
         chosen, info = self._bok_prm.select(env_stack, context=context)
         logger.info(
             "[dreamzero best-of-k] call %d: selector=exec chose candidate %d "
-            "(penalties=%s, margin_vs_cand0=%.6f)",
+            "(exec_pen=%s, exec_score=%s, cons_pen=%s, cons_score=%s, combined=%s)",
             self._bok_call_count,
             chosen,
-            [round(p, 6) for p in info["penalty"]],
-            info["margin_vs_cand0"],
+            [round(p, 6) for p in info.get("exec_penalty", info["penalty"])],
+            [round(s, 6) for s in info.get("exec_score", info["score"])],
+            (
+                [round(p, 6) for p in info["cons_penalty"]]
+                if "cons_penalty" in info
+                else None
+            ),
+            (
+                [round(s, 6) for s in info["cons_score"]]
+                if "cons_score" in info
+                else None
+            ),
+            (
+                [round(s, 6) for s in info["combined_score"]]
+                if "combined_score" in info
+                else None
+            ),
         )
         return chosen, info
 
