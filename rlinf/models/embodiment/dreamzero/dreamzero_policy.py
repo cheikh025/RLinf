@@ -71,6 +71,9 @@ class DreamZeroPolicy(VLA, BasePolicy):
         # (cross-chunk continuity term); see _select_candidate.
         self._bok_prm = None
         self._bok_prev_action = None
+        # Lazily-seeded RNG for the random-selection control baseline
+        # (bok_selector=random); see _select_random.
+        self._bok_random_rng = None
 
     # This method is called in FSDPModelManager.setup_model_and_optimizer
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs={}):
@@ -352,8 +355,9 @@ class DreamZeroPolicy(VLA, BasePolicy):
         the start of every call, so the K samplings are independent.
 
         Which candidate is executed depends on ``bok_selector``: "first"
-        (default) always executes candidate 0 (baseline behavior); "exec"
-        delegates to the executability PRM (see
+        (default) always executes candidate 0 (baseline behavior); "random"
+        picks one uniformly at random per env (control baseline, see
+        ``_select_random``); "exec" delegates to the executability PRM (see
         ``rlinf.models.embodiment.dreamzero.prm`` and ``_select_candidate``).
         All candidates are saved/logged for diversity verification.
 
@@ -500,7 +504,9 @@ class DreamZeroPolicy(VLA, BasePolicy):
 
         ``bok_selector`` (Hydra ``+actor.model.bok_selector``): "first"
         (default) always executes candidate 0 — exact baseline behavior;
-        "exec" ranks candidates with the PRM
+        "random" picks one candidate uniformly at random per env (the
+        control baseline that isolates the value of the selection metric, see
+        ``_select_random``); "exec" ranks candidates with the PRM
         (:class:`rlinf.models.embodiment.dreamzero.prm.DreamZeroPRM`),
         passing the previous executed action for the cross-chunk seam term.
 
@@ -514,9 +520,11 @@ class DreamZeroPolicy(VLA, BasePolicy):
         selector = selector.lower()
         if selector == "first":
             return 0, None
+        if selector == "random":
+            return self._select_random(env_actions)
         if selector != "exec":
             raise ValueError(
-                f"Unknown bok_selector {selector!r}; use 'first' or 'exec'."
+                f"Unknown bok_selector {selector!r}; use 'first', 'random', or 'exec'."
             )
         if self._bok_prm is None:
             from rlinf.models.embodiment.dreamzero.prm import DreamZeroPRM
@@ -598,6 +606,49 @@ class DreamZeroPolicy(VLA, BasePolicy):
                 ),
             )
         return chosen, info
+
+    def _select_random(self, env_actions: list) -> tuple[Any, dict]:
+        """Best-of-K control baseline: pick one candidate uniformly at random.
+
+        ``bok_selector=random``. The K candidates are generated exactly as for
+        the PRM selectors (same seeds, same diversity), but the choice ignores
+        every score — no PRM, no IDM, no dream decode. This isolates the value
+        of the selection *metric* from the value of merely having K samples:
+        compare its success rate against ``bok_selector=exec`` (consistency +
+        executability) and ``first`` (candidate 0). The choice is made per env.
+
+        Reproducible via ``bok_random_seed`` (default 0); the RNG is created
+        once and advances deterministically across calls, so a rerun with the
+        same seed reproduces the same selections.
+        """
+        num_candidates = len(env_actions)
+        num_envs = int(np.asarray(env_actions[0]).shape[0])
+        seed = int(getattr(self.config, "bok_random_seed", 0) or 0)
+        if self._bok_random_rng is None:
+            self._bok_random_rng = np.random.default_rng(seed)
+        chosen = self._bok_random_rng.integers(
+            0, num_candidates, size=num_envs
+        ).astype(np.int64)
+        chosen_counts = np.bincount(chosen, minlength=num_candidates).tolist()
+        info = {
+            "selector": "random",
+            "chosen_index_per_env": chosen.tolist(),
+            "chosen_counts": chosen_counts,
+            "bok_random_seed": seed,
+        }
+        logger.info(
+            "[dreamzero best-of-k] call %d: selector=random chose %s "
+            "(num_envs=%d, K=%d, chosen_counts=%s, seed=%d)",
+            self._bok_call_count,
+            chosen.tolist(),
+            num_envs,
+            num_candidates,
+            chosen_counts,
+            seed,
+        )
+        # Scalar for the single-env case (matches "first"); per-env list otherwise.
+        chosen_index = int(chosen[0]) if num_envs == 1 else chosen.tolist()
+        return chosen_index, info
 
     def _log_best_of_k_diversity(
         self,
