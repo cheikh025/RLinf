@@ -376,10 +376,16 @@ class DreamZeroPolicy(VLA, BasePolicy):
         base_seed = getattr(self.config, "bok_base_seed", None)
         base_seed = original_seed if base_seed is None else int(base_seed)
 
-        need_dreams = self._cons_dreams_needed()
+        need_cons = self._cons_dreams_needed()
+        # A latent IDM consumes ``video_pred`` directly (no decode); a pixel IDM
+        # needs the decoded RGB canvas. The kind is auto-detected by the PRM
+        # from the IDM checkpoint (see DreamZeroPRM / _load_consistency_idm).
+        uses_latent = bool(
+            need_cons and getattr(self._ensure_prm(), "cons_uses_latent", False)
+        )
         candidates = []
         seeds = []
-        dream_frames = []
+        cons_inputs = []  # per-candidate IDM inputs: raw latents or decoded RGB
         try:
             for k in range(num_candidates):
                 seed = base_seed + k
@@ -389,16 +395,17 @@ class DreamZeroPolicy(VLA, BasePolicy):
                 candidates.append(pred)
                 seeds.append(seed)
                 video_pred = pred.get("video_pred")
-                # Decode the dream once when consistency needs it (always-on,
-                # not gated by save_video_pred); reuse it for saving so a
+                # Build the consistency input once per candidate. For a latent
+                # IDM this is the raw latent (no decode at all). For a pixel IDM
+                # decode here and reuse it for the save hook, so a
                 # save+consistency run never decodes the same chunk twice.
-                decoded = (
-                    self._decode_dream(video_pred)
-                    if (need_dreams and video_pred is not None)
-                    else None
-                )
-                if decoded is not None:
-                    dream_frames.append(decoded)
+                decoded = None
+                if need_cons and video_pred is not None:
+                    if uses_latent:
+                        cons_inputs.append(video_pred)
+                    else:
+                        decoded = self._decode_dream(video_pred)
+                        cons_inputs.append(decoded)
                 self._maybe_save_video_pred(
                     video_pred,
                     mode=mode,
@@ -422,7 +429,7 @@ class DreamZeroPolicy(VLA, BasePolicy):
             env_actions.append(np.asarray(self._actions_from_unapply(cand_batch.act)))
 
         chosen_index, select_info = self._select_candidate(
-            env_actions, dream_frames if need_dreams else None
+            env_actions, cons_inputs if need_cons else None, uses_latent
         )
         selected_pred = self._gather_selected_candidate(candidates, chosen_index)
 
@@ -443,10 +450,12 @@ class DreamZeroPolicy(VLA, BasePolicy):
         return selected_pred
 
     def _cons_dreams_needed(self) -> bool:
-        """Whether best-of-K must decode dreams this call for the consistency
-        term: only when the exec selector is active and an IDM checkpoint is
-        configured (``bok_idm_model_path``). Independent of ``save_video_pred``
-        -- the consistency decode is always-on, the save decode is capped.
+        """Whether best-of-K must prepare the consistency input this call: only
+        when the exec selector is active and an IDM checkpoint is configured
+        (``bok_idm_model_path``). The input is the raw ``video_pred`` latent
+        for a latent IDM (no decode) or the decoded RGB canvas for a pixel IDM;
+        either way it is always-on here, independent of ``save_video_pred``
+        (whose own decode is separately capped).
         """
         selector = str(
             getattr(self.config, "bok_selector", "first") or "first"
@@ -497,8 +506,24 @@ class DreamZeroPolicy(VLA, BasePolicy):
                 out[key] = value
         return out
 
+    def _ensure_prm(self):
+        """Lazily build the best-of-K PRM selector (loads the IDM if configured).
+
+        Shared by ``_predict_best_of_k`` (to learn whether the consistency IDM
+        is latent) and ``_select_candidate``, so the PRM -- and its IDM -- is
+        constructed exactly once per policy.
+        """
+        if self._bok_prm is None:
+            from rlinf.models.embodiment.dreamzero.prm import DreamZeroPRM
+
+            self._bok_prm = DreamZeroPRM(self.config)
+        return self._bok_prm
+
     def _select_candidate(
-        self, env_actions: list, dream_frames: Optional[list] = None
+        self,
+        env_actions: list,
+        cons_inputs: Optional[list] = None,
+        uses_latent: bool = False,
     ) -> tuple[Any, Optional[dict]]:
         """Pick which best-of-K candidate to execute.
 
@@ -511,10 +536,12 @@ class DreamZeroPolicy(VLA, BasePolicy):
         passing the previous executed action for the cross-chunk seam term.
 
         When an IDM checkpoint is configured (``bok_idm_model_path``), the PRM
-        also scores cycle-consistency; ``dream_frames`` (the per-candidate
-        decoded RGB canvases from ``_decode_dream``) are split into the IDM's
-        per-view layout and passed in ``context["dream_videos"]``. Without an
-        IDM, ``dream_frames`` is ``None`` and selection is executability-only.
+        also scores cycle-consistency; ``cons_inputs`` (the per-candidate IDM
+        inputs prepared in ``_predict_best_of_k``) are passed in
+        ``context["dream_input"]`` -- raw WAM video latents when
+        ``uses_latent`` (latent IDM), otherwise the decoded RGB canvases split
+        into the IDM's per-view layout. Without an IDM, ``cons_inputs`` is
+        ``None`` and selection is executability-only.
         """
         selector = str(getattr(self.config, "bok_selector", "first") or "first")
         selector = selector.lower()
@@ -526,22 +553,23 @@ class DreamZeroPolicy(VLA, BasePolicy):
             raise ValueError(
                 f"Unknown bok_selector {selector!r}; use 'first', 'random', or 'exec'."
             )
-        if self._bok_prm is None:
-            from rlinf.models.embodiment.dreamzero.prm import DreamZeroPRM
-
-            self._bok_prm = DreamZeroPRM(self.config)
+        self._ensure_prm()
         env_stack = torch.as_tensor(np.stack(env_actions), dtype=torch.float32)
         context = {}
         if self._bok_prev_action is not None:
             context["prev_action"] = self._bok_prev_action
-        # Consistency term: split each decoded dream canvas into the IDM's
-        # per-view layout and stack to [K, B, V, F, 3, H, W/2].
-        if self._bok_prm.cons_scorer is not None and dream_frames:
-            from rlinf.models.embodiment.dreamzero.idm.model import split_canvas
+        # Consistency term input. Latent IDM: stack the raw WAM video latents
+        # [B, C, T, H, W] -> [K, B, C, T, H, W]. Pixel IDM: split each decoded
+        # canvas into the per-view layout -> [K, B, V, F, 3, H, W/2].
+        if self._bok_prm.cons_scorer is not None and cons_inputs:
+            if uses_latent:
+                context["dream_input"] = torch.stack(cons_inputs, dim=0)
+            else:
+                from rlinf.models.embodiment.dreamzero.idm.model import split_canvas
 
-            context["dream_videos"] = torch.stack(
-                [split_canvas(d) for d in dream_frames], dim=0
-            )
+                context["dream_input"] = torch.stack(
+                    [split_canvas(d) for d in cons_inputs], dim=0
+                )
         chosen, info = self._bok_prm.select(env_stack, context=context)
         chosen_per_env = info.get("chosen_index_per_env")
         num_envs = len(chosen_per_env) if isinstance(chosen_per_env, list) else 1

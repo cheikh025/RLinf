@@ -171,7 +171,8 @@ class ConsistencyScorer:
 
     For each best-of-K candidate, the IDM -- trained to invert a dreamed clip
     back to the action chunk that produced it -- predicts actions from the
-    decoded dream; the penalty is the distance to the WAM's predicted actions
+    dream (decoded RGB for a pixel IDM, or the raw WAM video latent for a
+    latent IDM); the penalty is the distance to the WAM's predicted actions
     on the 7 env dims: arm SmoothL1 in the IDM's *standardized* units (so
     translation does not drown rotation) plus gripper sign disagreement. Low
     penalty = video and actions tell the same story (internally coherent); a
@@ -199,14 +200,16 @@ class ConsistencyScorer:
     def score(
         self,
         env_actions: torch.Tensor,
-        dream_videos: torch.Tensor,
+        dream_input: torch.Tensor,
     ) -> dict[str, Any]:
         """Compute consistency penalties for K candidate chunks.
 
         Args:
             env_actions: ``[K, B, T, D]`` env-space WAM actions (gripper last).
-            dream_videos: ``[K, B, V, F, 3, H, W]`` uint8 decoded dreams in the
-                IDM's split-canvas layout (V views, F frames).
+            dream_input: ``[K, B, ...]`` per-candidate IDM input -- the decoded
+                dream in split-canvas layout ``[K, B, V, F, 3, H, W]`` for a
+                pixel IDM, or the raw WAM video latent ``[K, B, C, T, H, W]``
+                for a latent IDM. The trailing dims are fed to the IDM as-is.
 
         Returns:
             ``*_per_env`` matrices shaped ``[K, B]``. For ``B == 1``, flat
@@ -217,13 +220,13 @@ class ConsistencyScorer:
             raise ValueError(f"env_actions must be [K, B, T, D], got {a_wam.shape}")
         k, b, t, d = a_wam.shape
 
-        vids = torch.as_tensor(dream_videos)
-        if tuple(vids.shape[:2]) != (k, b):
+        clips = torch.as_tensor(dream_input)
+        if tuple(clips.shape[:2]) != (k, b):
             raise ValueError(
-                f"dream_videos must start [K={k}, B={b}, ...], got {tuple(vids.shape)}"
+                f"dream_input must start [K={k}, B={b}, ...], got {tuple(clips.shape)}"
             )
         # One batched IDM forward over all K*B clips, then back to [K, B, T, D].
-        idm_in = vids.reshape(k * b, *vids.shape[2:]).to(self.device)
+        idm_in = clips.reshape(k * b, *clips.shape[2:]).to(self.device)
         idm_act = self.idm.predict(idm_in).reshape(k, b, t, d).float().cpu()
 
         arm_std = self.idm.arm_std.detach().float().cpu().clamp_min(1e-6)
@@ -244,13 +247,61 @@ class ConsistencyScorer:
         return out
 
 
+def _load_consistency_idm(path: str, device: str):
+    """Load the consistency IDM, auto-detecting pixel vs latent.
+
+    The checkpoint's ``idm_cfg`` distinguishes them: a latent config
+    (:class:`...idm.latent_model.LatentIDMConfig`) carries ``latent_channels``,
+    a pixel config (:class:`...idm.model.IDMConfig`) does not. Returns
+    ``(model, is_latent)``; the model is frozen, eval, fp32. Resolves a
+    checkpoint directory the same way as the ``from_checkpoint`` helpers
+    (``best.pt`` > ``final.pt`` > ``latest.pt``).
+    """
+    import os
+
+    ckpt_path = path
+    if os.path.isdir(path):
+        for name in ("best.pt", "final.pt", "latest.pt"):
+            candidate = os.path.join(path, name)
+            if os.path.isfile(candidate):
+                ckpt_path = candidate
+                break
+        else:
+            raise FileNotFoundError(
+                f"No best.pt/final.pt/latest.pt in IDM checkpoint dir {path!r}"
+            )
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    if "idm_cfg" not in ckpt or "model" not in ckpt:
+        raise KeyError(
+            f"IDM checkpoint {ckpt_path!r} missing 'idm_cfg'/'model'."
+        )
+    cfg = ckpt["idm_cfg"]
+    is_latent = "latent_channels" in cfg
+    if is_latent:
+        from rlinf.models.embodiment.dreamzero.idm.latent_model import (
+            LatentActionIDM,
+            LatentIDMConfig,
+        )
+
+        model = LatentActionIDM(LatentIDMConfig(**cfg))
+    else:
+        from rlinf.models.embodiment.dreamzero.idm.model import IDM, IDMConfig
+
+        model = IDM(IDMConfig(**cfg))
+    model.load_state_dict(ckpt["model"])
+    model = model.eval().to(device=device, dtype=torch.float32).requires_grad_(False)
+    return model, is_latent
+
+
 class DreamZeroPRM:
     """Combine PRM terms and select which best-of-K candidate to execute.
 
     Always scores executability (:class:`ExecutabilityScorer`). When an IDM
     checkpoint is configured (``bok_idm_model_path``) *and* the policy passes
-    the decoded dreams in ``context["dream_videos"]``, the cycle-consistency
-    term (:class:`ConsistencyScorer`) is added and the two are combined as
+    the per-candidate dream in ``context["dream_input"]`` (decoded RGB for a
+    pixel IDM, or the raw video latent for a latent IDM -- auto-detected from
+    the checkpoint), the cycle-consistency term
+    (:class:`ConsistencyScorer`) is added and the two are combined as
     ``exec_lambda * exec_score + cons_lambda * cons_score`` on the bounded
     (0, SCORE_MAX] axis. Without an IDM (or without dreams) it is pure
     executability and behaves exactly as before.
@@ -285,16 +336,14 @@ class DreamZeroPRM:
         # checkpoint is configured (``bok_idm_model_path``), so executability-
         # only runs load no IDM and behave exactly as before.
         self.cons_scorer = None
+        self.cons_uses_latent = False
         self.exec_lambda = float(getattr(config, "bok_exec_lambda", 1.0))
         self.cons_lambda = float(getattr(config, "bok_cons_lambda", 1.0))
         idm_path = getattr(config, "bok_idm_model_path", None)
         if idm_path:
-            from rlinf.models.embodiment.dreamzero.idm.model import IDM
-
-            idm = IDM.from_checkpoint(
+            idm, self.cons_uses_latent = _load_consistency_idm(
                 str(idm_path),
-                device=str(getattr(config, "bok_idm_device", "cuda")),
-                dtype=torch.float32,
+                str(getattr(config, "bok_idm_device", "cuda")),
             )
             self.cons_scorer = ConsistencyScorer(
                 idm,
@@ -346,7 +395,7 @@ class DreamZeroPRM:
         # Consistency arm: only when an IDM is loaded and the policy supplied
         # the decoded dreams. Selection then maximizes the lambda-weighted sum
         # of the bounded executability and consistency scores.
-        dreams = context.get("dream_videos")
+        dreams = context.get("dream_input")
         if self.cons_scorer is not None and dreams is not None:
             cons = self.cons_scorer.score(env_actions, dreams)
             cons_pen_env = torch.as_tensor(
