@@ -21,3 +21,7 @@ rlinf/envs/maniskill/assets
 PKG-INFO
 *.egg-info/
 .claude/settings.json
+
+# Local DreamZero notes/docs and scratch checking scripts (kept out of GitHub)
+dreamzero_docs/
+dreamzero_checks/
