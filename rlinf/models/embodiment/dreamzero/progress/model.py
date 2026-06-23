@@ -130,8 +130,12 @@ class SmolVLAProgressModel(nn.Module):
 
     Parameter policy (design §3.2): SmolVLM2 is always frozen and in eval mode;
     the value query and value head train from step 0; the action expert is
-    frozen until the trainer calls :meth:`unfreeze_expert` (Stage 2 at step
-    2,000). Use :meth:`param_groups` for the two-learning-rate optimizer.
+    frozen until the trainer calls :meth:`unfreeze_expert` (Stage 2). The expert
+    is also held in **eval mode throughout** (dropout off) so the train-time and
+    eval/inference forwards match -- it still trains (gradients flow in eval
+    mode), but its dropout never perturbs the features the value head reads,
+    which otherwise makes the eval-mode value collapse toward -1. Use
+    :meth:`param_groups` for the two-learning-rate optimizer.
     """
 
     def __init__(self, config: Optional[ProgressModelConfig] = None, policy=None):
@@ -159,9 +163,11 @@ class SmolVLAProgressModel(nn.Module):
         self.value_query = make_value_query(d_expert, self.config.value_query_std)
         self.value_head = build_value_head(d_expert, hidden)
 
-        # SmolVLM2 frozen + eval for the whole run; expert frozen until Stage 2.
+        # SmolVLM2 frozen + eval for the whole run; expert frozen until Stage 2
+        # but always held in eval (dropout off) so train/eval forwards match.
         self.freeze_vlm()
         self.freeze_expert()
+        self.vlm_with_expert.lm_expert.eval()
 
     # ------------------------------------------------------------------
     # Construction helpers
@@ -202,9 +208,19 @@ class SmolVLAProgressModel(nn.Module):
         return bool(getattr(self, "_expert_trainable", False))
 
     def train(self, mode: bool = True) -> "SmolVLAProgressModel":
-        """Set train mode but keep SmolVLM2 frozen in eval (design §3.2)."""
+        """Set train mode but hold SmolVLM2 *and* the action expert in eval.
+
+        The backbone is frozen, and the expert -- trainable from Stage 2 -- is
+        kept in eval mode so its dropout is **off in both training and
+        eval/inference**. Gradients still flow through an eval-mode module, so
+        the expert trains normally; eval only disables dropout. Without this the
+        value head learns against the expert's train-mode (dropout-on) features
+        and then collapses toward -1 at eval -- where the model is actually
+        deployed (design §3.2).
+        """
         super().train(mode)
         self.vlm_with_expert.vlm.eval()
+        self.vlm_with_expert.lm_expert.eval()
         return self
 
     def expert_parameters(self):
