@@ -216,8 +216,13 @@ class EMATarget:
         target = SmolVLAProgressModel.__new__(SmolVLAProgressModel)
         torch.nn.Module.__init__(target)
         target.config = online.config
-        target.policy = online.policy
-        target.vla = online.vla  # shared prefix-formatting attributes
+        # Store the shared online policy/vla as plain attributes, NOT registered
+        # submodules: otherwise ``target.requires_grad_(False)`` / ``.eval()``
+        # below recurse into them and freeze/flip the *online* action expert they
+        # contain (the expert lives in online.vla.vlm_with_expert.lm_expert),
+        # which would silently un-train the expert for all of Stage 3.
+        object.__setattr__(target, "policy", online.policy)
+        object.__setattr__(target, "vla", online.vla)
         target.vlm_with_expert = target_vwe
         target.value_query = torch.nn.Parameter(online.value_query.detach().clone())
         target.value_head = copy.deepcopy(online.value_head)

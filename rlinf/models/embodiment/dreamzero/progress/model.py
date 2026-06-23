@@ -167,7 +167,7 @@ class SmolVLAProgressModel(nn.Module):
         # but always held in eval (dropout off) so train/eval forwards match.
         self.freeze_vlm()
         self.freeze_expert()
-        self.vlm_with_expert.lm_expert.eval()
+        self.vlm_with_expert.eval()
 
     # ------------------------------------------------------------------
     # Construction helpers
@@ -219,8 +219,13 @@ class SmolVLAProgressModel(nn.Module):
         deployed (design §3.2).
         """
         super().train(mode)
-        self.vlm_with_expert.vlm.eval()
-        self.vlm_with_expert.lm_expert.eval()
+        # Force the *entire* VLM+expert wrapper to eval so no dropout anywhere in
+        # the backbone/expert path is active during training -- not just .vlm and
+        # .lm_expert, but any fusion/attention dropout that lives directly on the
+        # wrapper. The expert still trains (gradients flow in eval mode); eval
+        # only disables dropout, which is what makes the train and eval/inference
+        # forwards match (design §3.2).
+        self.vlm_with_expert.eval()
         return self
 
     def expert_parameters(self):
