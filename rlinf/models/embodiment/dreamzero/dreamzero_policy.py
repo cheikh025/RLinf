@@ -59,10 +59,13 @@ class DreamZeroPolicy(VLA, BasePolicy):
                 "DreamZeroPolicy requires config.embodiment_tag (set in get_model)."
             )
         self._rollout_obs_layout = rollout_obs_layout_for_embodiment(embodiment_tag)
-        _, _, action_keys, _ = collect_dreamzero_dataset_keys(
+        _, _, action_keys, language_keys = collect_dreamzero_dataset_keys(
             config.data_transforms, embodiment_tag
         )
         self._action_keys = tuple(action_keys)
+        # Model-space language key in the converted obs (for the progress PRM
+        # term's conditioning; see _progress_conditioning).
+        self._language_key = str(language_keys[0]) if language_keys else None
         # Debug counter for save_video_pred (see _maybe_save_video_pred).
         self._video_pred_call_count = 0
         # Counter for best-of-K candidate sampling (see _predict_best_of_k).
@@ -383,9 +386,11 @@ class DreamZeroPolicy(VLA, BasePolicy):
         uses_latent = bool(
             need_cons and getattr(self._ensure_prm(), "cons_uses_latent", False)
         )
+        need_prog = self._prog_dreams_needed()
         candidates = []
         seeds = []
         cons_inputs = []  # per-candidate IDM inputs: raw latents or decoded RGB
+        prog_dreams = []  # per-candidate decoded RGB canvases for the progress term
         try:
             for k in range(num_candidates):
                 seed = base_seed + k
@@ -395,17 +400,20 @@ class DreamZeroPolicy(VLA, BasePolicy):
                 candidates.append(pred)
                 seeds.append(seed)
                 video_pred = pred.get("video_pred")
-                # Build the consistency input once per candidate. For a latent
-                # IDM this is the raw latent (no decode at all). For a pixel IDM
-                # decode here and reuse it for the save hook, so a
-                # save+consistency run never decodes the same chunk twice.
+                # Decode the dream once per candidate when something needs RGB:
+                # the pixel-IDM consistency term and/or the progress term (which
+                # always scores decoded RGB, independent of the IDM kind). The
+                # decode is reused by the save hook so a chunk is never decoded
+                # twice. A latent IDM consumes the raw ``video_pred`` directly.
                 decoded = None
+                if video_pred is not None and (
+                    need_prog or (need_cons and not uses_latent)
+                ):
+                    decoded = self._decode_dream(video_pred)
                 if need_cons and video_pred is not None:
-                    if uses_latent:
-                        cons_inputs.append(video_pred)
-                    else:
-                        decoded = self._decode_dream(video_pred)
-                        cons_inputs.append(decoded)
+                    cons_inputs.append(video_pred if uses_latent else decoded)
+                if need_prog and decoded is not None:
+                    prog_dreams.append(decoded)
                 self._maybe_save_video_pred(
                     video_pred,
                     mode=mode,
@@ -429,7 +437,11 @@ class DreamZeroPolicy(VLA, BasePolicy):
             env_actions.append(np.asarray(self._actions_from_unapply(cand_batch.act)))
 
         chosen_index, select_info = self._select_candidate(
-            env_actions, cons_inputs if need_cons else None, uses_latent
+            env_actions,
+            cons_inputs if need_cons else None,
+            uses_latent,
+            prog_dreams if need_prog else None,
+            obs,
         )
         selected_pred = self._gather_selected_candidate(candidates, chosen_index)
 
@@ -463,6 +475,37 @@ class DreamZeroPolicy(VLA, BasePolicy):
         if selector != "exec":
             return False
         return bool(getattr(self.config, "bok_idm_model_path", None))
+
+    def _prog_dreams_needed(self) -> bool:
+        """Whether best-of-K must decode dreams for the progress term this call:
+        only when the exec selector is active and a progress checkpoint is
+        configured (``bok_progress_model_path``). The progress model always
+        scores decoded RGB dreams, independent of the IDM's pixel/latent kind.
+        """
+        selector = str(
+            getattr(self.config, "bok_selector", "first") or "first"
+        ).lower()
+        if selector != "exec":
+            return False
+        return bool(getattr(self.config, "bok_progress_model_path", None))
+
+    def _progress_conditioning(self, obs: dict) -> tuple[np.ndarray, np.ndarray, list]:
+        """Raw conditioning frames + language for the progress term (design §12).
+
+        Returns the current-obs exterior/wrist frames ``[B, H, W, 3]`` (the
+        conditioning state ``o_t``) and the per-env instruction list, pulled
+        from the converted obs by the embodiment's video / language keys. The
+        ProgressScorer puts the real frames through the same dream geometry the
+        value model trained on.
+        """
+        ext_key = self._rollout_obs_layout.video_fields[0][1]
+        wri_key = self._rollout_obs_layout.video_fields[1][1]
+        cond_ext = np.asarray(obs[ext_key])[:, 0]  # drop T=1 -> [B, H, W, 3]
+        cond_wri = np.asarray(obs[wri_key])[:, 0]
+        language = obs.get(self._language_key)
+        if language is None:
+            language = [""] * cond_ext.shape[0]
+        return cond_ext, cond_wri, list(language)
 
     @staticmethod
     def _chosen_per_env(chosen_index: Any, batch_size: int) -> np.ndarray:
@@ -524,6 +567,8 @@ class DreamZeroPolicy(VLA, BasePolicy):
         env_actions: list,
         cons_inputs: Optional[list] = None,
         uses_latent: bool = False,
+        prog_dreams: Optional[list] = None,
+        obs: Optional[dict] = None,
     ) -> tuple[Any, Optional[dict]]:
         """Pick which best-of-K candidate to execute.
 
@@ -542,6 +587,12 @@ class DreamZeroPolicy(VLA, BasePolicy):
         ``uses_latent`` (latent IDM), otherwise the decoded RGB canvases split
         into the IDM's per-view layout. Without an IDM, ``cons_inputs`` is
         ``None`` and selection is executability-only.
+
+        When a progress checkpoint is configured (``bok_progress_model_path``),
+        the per-candidate decoded dreams ``prog_dreams`` and the current ``obs``
+        are passed in ``context["progress"]`` (design §12) -- the dreams split
+        into per-view RGB, plus the raw conditioning frame and language -- so
+        the PRM adds the signed progress reward term.
         """
         selector = str(getattr(self.config, "bok_selector", "first") or "first")
         selector = selector.lower()
@@ -570,6 +621,20 @@ class DreamZeroPolicy(VLA, BasePolicy):
                 context["dream_input"] = torch.stack(
                     [split_canvas(d) for d in cons_inputs], dim=0
                 )
+        # Progress term input (design §12): per-candidate dreams split into
+        # exterior/wrist views -> [K, B, V, F, 3, H, W], plus the raw
+        # conditioning frame and language. Only when a progress model is loaded.
+        if self._bok_prm.prog_scorer is not None and prog_dreams and obs is not None:
+            from rlinf.models.embodiment.dreamzero.idm.model import split_canvas
+
+            dream_rgb = torch.stack([split_canvas(d) for d in prog_dreams], dim=0)
+            cond_ext, cond_wri, language = self._progress_conditioning(obs)
+            context["progress"] = {
+                "dream_rgb": dream_rgb,
+                "cond_ext": cond_ext,
+                "cond_wri": cond_wri,
+                "language": language,
+            }
         chosen, info = self._bok_prm.select(env_stack, context=context)
         chosen_per_env = info.get("chosen_index_per_env")
         num_envs = len(chosen_per_env) if isinstance(chosen_per_env, list) else 1
