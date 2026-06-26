@@ -294,145 +294,195 @@ def _load_consistency_idm(path: str, device: str):
     return model, is_latent
 
 
-def _load_progress_model(path: str, device: str):
-    """Load the frozen SmolVLA progress value model for PRM scoring (§10).
+def _load_robometer_progress(path: str, device: str):
+    """Load the frozen Robometer reward model for PRM progress scoring (§10).
 
-    Returns the model eval/frozen on ``device`` (the ``from_checkpoint``
-    contract). A directory is resolved via the checkpoint's ``progress.pt``.
+    In-process load via Robometer's own ``load_model_from_hf`` (NOT a full
+    ``pip install -e .`` -- see ``dreamzero_robometer_combined_env_README.md``);
+    imports are lazy so this module still imports where Robometer is absent
+    (exec-only / non-progress runs). Returns a bundle of the frozen model +
+    collator + the discrete-progress decode settings the scorer needs, mirroring
+    ``scripts/example_inference_local.py``.
     """
-    from rlinf.models.embodiment.dreamzero.progress.model import (
-        SmolVLAProgressModel,
-    )
+    import torch as _torch
 
-    return SmolVLAProgressModel.from_checkpoint(str(path), device=str(device))
+    from robometer.utils.save import load_model_from_hf
+    from robometer.utils.setup_utils import setup_batch_collator
+
+    dev = _torch.device(device)
+    exp_config, tokenizer, processor, reward_model = load_model_from_hf(
+        model_path=str(path), device=dev
+    )
+    reward_model.eval()
+    collator = setup_batch_collator(processor, tokenizer, exp_config, is_eval=True)
+
+    # Discrete-progress decode settings, derived exactly as the reference script
+    # (Robometer-4B-LIBERO: progress_discrete_bins=32, discrete loss).
+    loss_config = getattr(exp_config, "loss", None)
+    is_discrete = (
+        getattr(loss_config, "progress_loss_type", "l2").lower() == "discrete"
+        if loss_config
+        else False
+    )
+    num_bins = getattr(loss_config, "progress_discrete_bins", None) or getattr(
+        exp_config.model, "progress_discrete_bins", 10
+    )
+    return {
+        "model": reward_model,
+        "tokenizer": tokenizer,
+        "collator": collator,
+        "device": dev,
+        "is_discrete": bool(is_discrete),
+        "num_bins": int(num_bins),
+    }
+
+
+#: Locked Phase-2 frame contract
+#: (``dreamzero_robometer_progress_phase2_input_contract_README.md`` §2): of the
+#: F=9 dream frames (0 = conditioning ô_t, 1..8 dreamed) send exactly 4 -- anchor
+#: + 3 evenly-spanned futures (env offsets 0/9/18/24) -- so Robometer's collator
+#: does no internal subsample and we know which progress_pred is anchor vs future.
+ROBOMETER_FRAME_INDICES = (0, 3, 6, 8)
 
 
 class ProgressScorer:
     """Signed progress reward ``r_progress`` for best-of-K candidates (§10).
 
-    Scores each candidate's dreamed future with the trained SmolVLA progress
-    value model ``Vθ(o, l) ∈ [-1, 1]`` and returns the advance toward task
-    completion relative to the conditioning frame::
+    Scores each candidate's dreamed future with the frozen **Robometer** reward
+    model (``aliangdw/Robometer-4B-LIBERO``) and returns the advance toward task
+    completion relative to the dreamed conditioning frame::
 
-        r_progress(c_k, l) = mean_{j=1..F} Vθ(ô_{k,t+j}, l) − Vθ(o_t, l)
+        r_progress(c_k, l) = mean(p1, p2, p3) − p0
 
-    The conditioning value ``Vθ(o_t, l)`` is computed once and shared across the
-    K candidates. Pixels are preprocessed exactly as in training via the shared
-    :class:`...progress.data.SmolVLAProgressCollator`: the real conditioning
-    frame goes through the full dream-geometry + SmolVLA pipeline, while the
-    dreamed frames are already in the WAM canvas geometry so they take only the
-    SmolVLA image stage (``[0, 255]`` -> resize-with-pad -> ``[-1, 1]``).
+    where ``[p0, p1, p2, p3]`` are Robometer's per-frame ``progress_pred`` on the
+    4 sent frames: the exterior view, hflipped to Robometer orientation, at dream
+    indices ``[0, 3, 6, 8]`` (frame 0 = anchor ô_t). Pixels and prompt cross the
+    boundary into Robometer's OWN loader / collator / template / forward -- we
+    never re-implement a fragment (Phase-2 governing rule). See
+    ``dreamzero_robometer_progress_phase2_input_contract_README.md``.
+
+    ``progress_pred`` is in ``[0, 1]`` (vs SmolVLA's ``[-1, 1]``), so
+    ``bok_prog_lambda`` must be re-tuned to this range (Phase 6).
     """
 
-    def __init__(
-        self,
-        model,
-        num_future_frames: int = 8,
-        max_frames_per_call: int = 0,
-    ):
-        from rlinf.models.embodiment.dreamzero.progress.data import (
-            SmolVLAProgressCollator,
-        )
+    def __init__(self, bundle: dict, frame_indices=ROBOMETER_FRAME_INDICES):
+        self.model = bundle["model"]
+        self.tokenizer = bundle["tokenizer"]
+        self.collator = bundle["collator"]
+        self.device = bundle["device"]
+        self.is_discrete = bundle["is_discrete"]
+        self.num_bins = bundle["num_bins"]
+        self.frame_indices = tuple(int(i) for i in frame_indices)
 
-        self.model = model
-        self.device = next(model.parameters()).device
-        # Reuse the training collator so tokenization + conditioning-frame
-        # preprocessing match the checkpoint exactly.
-        self.collator = SmolVLAProgressCollator(model.policy)
-        self.resize_hw = self.collator.resize_hw
-        self.num_future = int(num_future_frames)
-        self.max_frames_per_call = int(max_frames_per_call)
+    def _candidate_frames(self, dream_rgb: torch.Tensor) -> np.ndarray:
+        """``[K,B,2,F,3,H,W]`` dream -> ``[K,B,4,H,W,3]`` uint8 RGB, Robometer-ready.
 
-    def _smolvla_prep(self, frames_b3hw: torch.Tensor) -> torch.Tensor:
-        """SmolVLA image stage on already-canvas dream frames (pixels [0, 255]);
-        mirrors the collator's stage-2 (resize-with-pad to SigLIP, ``[-1, 1]``)."""
-        from lerobot.policies.smolvla.modeling_smolvla import resize_with_pad
-
-        x = frames_b3hw.to(torch.float32).div(255.0)
-        return resize_with_pad(x, *self.resize_hw, pad_value=0) * 2.0 - 1.0
-
-    def _value(self, images, lang_tokens, lang_masks) -> torch.Tensor:
-        masks = [
-            torch.ones(images[0].shape[0], dtype=torch.bool, device=self.device)
-            for _ in images
-        ]
-        use_cuda = str(self.device).startswith("cuda")
-        with torch.autocast(
-            device_type="cuda" if use_cuda else "cpu", dtype=torch.bfloat16
-        ):
-            v = self.model(images, masks, lang_tokens, lang_masks)
-        return v.float()
-
-    @torch.no_grad()
-    def score(
-        self,
-        dream_rgb: torch.Tensor,
-        cond_ext: Any,
-        cond_wri: Any,
-        language: list,
-    ) -> dict[str, Any]:
-        """Per-candidate signed progress reward.
-
-        Args:
-            dream_rgb: ``[K, B, 2, F, 3, H, W]`` per-candidate decoded dream split
-                into exterior/wrist views, pixels in ``[0, 255]``. Frame 0 is the
-                conditioning obs ``ô_t`` (chunk offset 0); only the future frames
-                ``1..F-1`` are averaged (the design's ``j = 1..8``).
-            cond_ext / cond_wri: ``[B, H0, W0, 3]`` raw current-obs exterior /
-                wrist frames (the conditioning state ``o_t``).
-            language: list of ``B`` verbatim LIBERO instruction strings.
-
-        Returns:
-            ``progress_reward_per_env`` ``[K, B]`` (signed) plus
-            ``progress_future_per_env`` and ``progress_cond_per_env`` for logging;
-            flat per-candidate lists for ``B == 1``.
+        Exterior view only (index 0), subsample to the 4 contract frames,
+        CHW->HWC, uint8, then hflip the width axis (PI dreams are mirrored vs
+        Robometer). Wrist view (index 1) is never sent -- Robometer-4B-LIBERO is
+        single-view (agentview).
         """
         dream = torch.as_tensor(dream_rgb, dtype=torch.float32)
         if dream.ndim != 7 or dream.shape[2] != 2:
             raise ValueError(
                 f"dream_rgb must be [K, B, 2, F, 3, H, W], got {tuple(dream.shape)}"
             )
-        k, b, _v, f, c, h, w = dream.shape
-        # Frame 0 of the WAM dream is the conditioning observation o_t (chunk
-        # offset 0; idm/data.py num_frames=9 at offsets 0, 3, ..., 24). The
-        # progress reward averages the *future* frames j=1..8 only (design §10),
-        # so drop frame 0 -- including it would fold ô_t (≈ o_t) into the mean
-        # and partly cancel the − Vθ(o_t) term.
-        n_future = max(f - 1, 0)
-        nf = min(self.num_future or n_future, n_future)
-        dream = dream[:, :, :, 1:1 + nf]  # future frames j = 1..nf
+        f = dream.shape[3]
+        idx = list(self.frame_indices)
+        if max(idx) >= f:
+            raise ValueError(
+                f"frame_indices {idx} exceed F={f} dream frames"
+            )
+        ext = dream[:, :, 0][:, :, idx]  # [K, B, 4, 3, H, W] exterior, subsampled
+        ext = ext.clamp(0, 255).round().to(torch.uint8)
+        ext = ext.permute(0, 1, 2, 4, 5, 3).contiguous()  # CHW -> HWC: [K,B,4,H,W,3]
+        frames = ext.cpu().numpy()[..., ::-1, :]  # hflip width -> Robometer orient.
+        return np.ascontiguousarray(frames)
 
-        # Language + conditioning value: computed once, shared across all K.
-        lt, lm = self.collator._tokenize(list(language))
-        lt = lt.to(self.device)
-        lm = lm.to(self.device)
-        c_ext, c_wri = self.collator._prep_views(
-            [np.asarray(x) for x in cond_ext], [np.asarray(x) for x in cond_wri]
-        )
-        v_cond = self._value(
-            [c_ext.to(self.device), c_wri.to(self.device)], lt, lm
-        )  # [B]
+    @torch.no_grad()
+    def _robometer_progress(self, frames_hwc: np.ndarray, task: str) -> np.ndarray:
+        """One clip -> Robometer per-frame ``progress_pred`` via their own forward.
 
-        # Future frames: [K,B,2,nf,3,H,W] -> per-view [K*B*nf,3,H,W] SmolVLA prep.
-        ext = self._smolvla_prep(
-            dream[:, :, 0].reshape(k * b * nf, c, h, w).to(self.device)
-        )
-        wri = self._smolvla_prep(
-            dream[:, :, 1].reshape(k * b * nf, c, h, w).to(self.device)
-        )
-        ltf = lt[None, :, None].expand(k, b, nf, -1).reshape(k * b * nf, -1)
-        lmf = lm[None, :, None].expand(k, b, nf, -1).reshape(k * b * nf, -1)
-        n = ext.shape[0]
-        step = self.max_frames_per_call or n
-        outs = [
-            self._value([ext[i:i + step], wri[i:i + step]], ltf[i:i + step], lmf[i:i + step])
-            for i in range(0, n, step)
-        ]
-        v_future = torch.cat(outs, dim=0).reshape(k, b, nf).mean(dim=2)  # [K, B]
+        Builds a ``Trajectory``/``ProgressSample``, runs Robometer's collator and
+        ``compute_batch_outputs`` exactly as ``scripts/example_inference_local.py``
+        -- the prompt template, ``<|prog_token|>`` insertion, resize, and 32-bin
+        softmax-expectation all stay inside Robometer.
+        """
+        from robometer.data.dataset_types import ProgressSample, Trajectory
+        from robometer.evals.eval_server import compute_batch_outputs
 
-        reward = v_future - v_cond[None, :]  # [K, B]
-        out = {"progress_cond_per_env": v_cond.tolist()}
-        out.update(_per_env_payload("progress_future", v_future))
+        traj = Trajectory(
+            frames=frames_hwc,
+            frames_shape=tuple(frames_hwc.shape),
+            task=task,
+            id="0",
+            metadata={"subsequence_length": int(frames_hwc.shape[0])},
+            video_embeddings=None,
+        )
+        batch = self.collator(
+            [ProgressSample(trajectory=traj, sample_type="progress")]
+        )
+        progress_inputs = batch["progress_inputs"]
+        for key, value in progress_inputs.items():
+            if hasattr(value, "to"):
+                progress_inputs[key] = value.to(self.device)
+        results = compute_batch_outputs(
+            self.model,
+            self.tokenizer,
+            progress_inputs,
+            sample_type="progress",
+            is_discrete_mode=self.is_discrete,
+            num_bins=self.num_bins,
+        )
+        preds = results.get("progress_pred", [])
+        return (
+            np.asarray(preds[0], dtype=np.float32)
+            if preds
+            else np.zeros(0, dtype=np.float32)
+        )
+
+    @torch.no_grad()
+    def score(self, dream_rgb: torch.Tensor, language: list) -> dict[str, Any]:
+        """Per-candidate signed progress reward.
+
+        Args:
+            dream_rgb: ``[K, B, 2, F, 3, H, W]`` per-candidate decoded dream split
+                into exterior/wrist views, pixels in ``[0, 255]``. Frame 0 is the
+                conditioning obs ``ô_t``; frames are subsampled to the contract
+                set ``[0, 3, 6, 8]`` (anchor + 3 futures).
+            language: list of ``B`` verbatim LIBERO instruction strings; element
+                ``b`` goes straight to Robometer's prompt template.
+
+        Returns:
+            ``progress_reward_per_env`` ``[K, B]`` (signed) plus
+            ``progress_future_per_env`` and ``progress_cond_per_env`` for logging;
+            flat per-candidate lists for ``B == 1``.
+        """
+        frames = self._candidate_frames(dream_rgb)  # [K, B, 4, H, W, 3] uint8
+        k, b, n_sent = frames.shape[0], frames.shape[1], frames.shape[2]
+        lang = list(language)
+        preds = np.zeros((k, b, n_sent), dtype=np.float32)
+        for ki in range(k):
+            for bi in range(b):
+                task = lang[bi] if bi < len(lang) else ""
+                p = self._robometer_progress(frames[ki, bi], task)
+                if p.shape[0] != n_sent:
+                    raise ValueError(
+                        f"Robometer returned {p.shape[0]} progress values for "
+                        f"{n_sent} sent frames (candidate k={ki}, b={bi}); the "
+                        "collator subsampled -- check the frame contract (§2)."
+                    )
+                preds[ki, bi] = p
+
+        # r_progress = mean(future) − anchor; signed, added directly (not through
+        # _bounded). progress_pred ∈ [0, 1], so reward ∈ [-1, 1].
+        anchor = torch.as_tensor(preds[..., 0], dtype=torch.float32)  # [K, B]
+        future = torch.as_tensor(
+            preds[..., 1:].mean(axis=-1), dtype=torch.float32
+        )  # [K, B]
+        reward = future - anchor  # [K, B]
+        out = {"progress_cond_per_env": anchor.tolist()}
+        out.update(_per_env_payload("progress_future", future))
         out.update(_per_env_payload("progress_reward", reward))
         return out
 
@@ -447,8 +497,8 @@ class DreamZeroPRM:
     the checkpoint), the cycle-consistency term
     (:class:`ConsistencyScorer`) is added. When a progress checkpoint is
     configured (``bok_progress_model_path``) *and* the policy supplies the
-    dreams + conditioning + language in ``context["progress"]``, the signed
-    progress reward (:class:`ProgressScorer`, design §10) is added too. The
+    dreams + language in ``context["progress"]``, the signed progress reward
+    (:class:`ProgressScorer`, Robometer, design §10) is added too. The
     active terms combine as ``exec_lambda * exec_score + cons_lambda *
     cons_score + prog_lambda * r_progress``. Without any extra term it is pure
     executability and behaves exactly as before.
@@ -462,9 +512,9 @@ class DreamZeroPRM:
     ``bok_exec_w_grip``, ``bok_exec_w_acc``, ``bok_exec_w_jerk``; for
     consistency ``bok_idm_model_path``, ``bok_idm_device``,
     ``bok_exec_lambda``, ``bok_cons_lambda``, ``bok_cons_arm_w``,
-    ``bok_cons_grip_w``; and for progress ``bok_progress_model_path``,
-    ``bok_progress_device``, ``bok_prog_lambda``, ``bok_progress_num_frames``,
-    ``bok_progress_chunk``.
+    ``bok_cons_grip_w``; and for progress ``bok_progress_model_path``
+    (Robometer-4B-LIBERO checkpoint dir), ``bok_progress_device``,
+    ``bok_prog_lambda``.
     """
 
     #: EVA's bounded score mapping (logged only; argmin of penalty is the
@@ -509,12 +559,10 @@ class DreamZeroPRM:
         prog_path = getattr(config, "bok_progress_model_path", None)
         if prog_path:
             self.prog_scorer = ProgressScorer(
-                _load_progress_model(
+                _load_robometer_progress(
                     str(prog_path),
                     str(getattr(config, "bok_progress_device", "cuda")),
-                ),
-                num_future_frames=int(getattr(config, "bok_progress_num_frames", 8)),
-                max_frames_per_call=int(getattr(config, "bok_progress_chunk", 0)),
+                )
             )
 
     def _bounded(self, penalty):

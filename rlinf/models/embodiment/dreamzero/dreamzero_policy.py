@@ -64,7 +64,7 @@ class DreamZeroPolicy(VLA, BasePolicy):
         )
         self._action_keys = tuple(action_keys)
         # Model-space language key in the converted obs (for the progress PRM
-        # term's conditioning; see _progress_conditioning).
+        # term's prompt; see _progress_language).
         self._language_key = str(language_keys[0]) if language_keys else None
         # Debug counter for save_video_pred (see _maybe_save_video_pred).
         self._video_pred_call_count = 0
@@ -489,23 +489,18 @@ class DreamZeroPolicy(VLA, BasePolicy):
             return False
         return bool(getattr(self.config, "bok_progress_model_path", None))
 
-    def _progress_conditioning(self, obs: dict) -> tuple[np.ndarray, np.ndarray, list]:
-        """Raw conditioning frames + language for the progress term (design §12).
+    def _progress_language(self, obs: dict) -> list:
+        """Per-env instruction strings for the progress term (design §12).
 
-        Returns the current-obs exterior/wrist frames ``[B, H, W, 3]`` (the
-        conditioning state ``o_t``) and the per-env instruction list, pulled
-        from the converted obs by the embodiment's video / language keys. The
-        ProgressScorer puts the real frames through the same dream geometry the
-        value model trained on.
+        Robometer scores the dreamed exterior frames directly (anchor = dream
+        frame 0), so the only conditioning it needs is the verbatim LIBERO
+        instruction, pulled from the converted obs by the language key.
         """
-        ext_key = self._rollout_obs_layout.video_fields[0][1]
-        wri_key = self._rollout_obs_layout.video_fields[1][1]
-        cond_ext = np.asarray(obs[ext_key])[:, 0]  # drop T=1 -> [B, H, W, 3]
-        cond_wri = np.asarray(obs[wri_key])[:, 0]
         language = obs.get(self._language_key)
         if language is None:
-            language = [""] * cond_ext.shape[0]
-        return cond_ext, cond_wri, list(language)
+            ext_key = self._rollout_obs_layout.video_fields[0][1]
+            language = [""] * np.asarray(obs[ext_key]).shape[0]
+        return list(language)
 
     @staticmethod
     def _chosen_per_env(chosen_index: Any, batch_size: int) -> np.ndarray:
@@ -591,8 +586,8 @@ class DreamZeroPolicy(VLA, BasePolicy):
         When a progress checkpoint is configured (``bok_progress_model_path``),
         the per-candidate decoded dreams ``prog_dreams`` and the current ``obs``
         are passed in ``context["progress"]`` (design §12) -- the dreams split
-        into per-view RGB, plus the raw conditioning frame and language -- so
-        the PRM adds the signed progress reward term.
+        into per-view RGB, plus the verbatim instruction language -- so the PRM
+        adds the signed Robometer progress reward term.
         """
         selector = str(getattr(self.config, "bok_selector", "first") or "first")
         selector = selector.lower()
@@ -628,13 +623,8 @@ class DreamZeroPolicy(VLA, BasePolicy):
             from rlinf.models.embodiment.dreamzero.idm.model import split_canvas
 
             dream_rgb = torch.stack([split_canvas(d) for d in prog_dreams], dim=0)
-            cond_ext, cond_wri, language = self._progress_conditioning(obs)
-            context["progress"] = {
-                "dream_rgb": dream_rgb,
-                "cond_ext": cond_ext,
-                "cond_wri": cond_wri,
-                "language": language,
-            }
+            language = self._progress_language(obs)
+            context["progress"] = {"dream_rgb": dream_rgb, "language": language}
         chosen, info = self._bok_prm.select(env_stack, context=context)
         chosen_per_env = info.get("chosen_index_per_env")
         num_envs = len(chosen_per_env) if isinstance(chosen_per_env, list) else 1
