@@ -343,6 +343,7 @@ def _load_robometer_progress(path: str, device: str):
 #: + 3 evenly-spanned futures (env offsets 0/9/18/24) -- so Robometer's collator
 #: does no internal subsample and we know which progress_pred is anchor vs future.
 ROBOMETER_FRAME_INDICES = (0, 3, 6, 8)
+DEFAULT_ROBOMETER_PROGRESS_BATCH_SIZE = 50
 
 
 class ProgressScorer:
@@ -365,7 +366,12 @@ class ProgressScorer:
     ``bok_prog_lambda`` must be re-tuned to this range (Phase 6).
     """
 
-    def __init__(self, bundle: dict, frame_indices=ROBOMETER_FRAME_INDICES):
+    def __init__(
+        self,
+        bundle: dict,
+        frame_indices=ROBOMETER_FRAME_INDICES,
+        batch_size: int = DEFAULT_ROBOMETER_PROGRESS_BATCH_SIZE,
+    ):
         self.model = bundle["model"]
         self.tokenizer = bundle["tokenizer"]
         self.collator = bundle["collator"]
@@ -373,6 +379,7 @@ class ProgressScorer:
         self.is_discrete = bundle["is_discrete"]
         self.num_bins = bundle["num_bins"]
         self.frame_indices = tuple(int(i) for i in frame_indices)
+        self.batch_size = max(1, int(batch_size))
 
     def _candidate_frames(self, dream_rgb: torch.Tensor) -> np.ndarray:
         """``[K,B,2,F,3,H,W]`` dream -> ``[K,B,4,H,W,3]`` uint8 RGB, Robometer-ready.
@@ -400,28 +407,33 @@ class ProgressScorer:
         return np.ascontiguousarray(frames)
 
     @torch.no_grad()
-    def _robometer_progress(self, frames_hwc: np.ndarray, task: str) -> np.ndarray:
-        """One clip -> Robometer per-frame ``progress_pred`` via their own forward.
+    def _robometer_progress_batch(
+        self, frames_batch_hwc: np.ndarray, tasks: list[str]
+    ) -> list[np.ndarray]:
+        """Batch of clips -> Robometer per-frame ``progress_pred`` outputs.
 
-        Builds a ``Trajectory``/``ProgressSample``, runs Robometer's collator and
-        ``compute_batch_outputs`` exactly as ``scripts/example_inference_local.py``
-        -- the prompt template, ``<|prog_token|>`` insertion, resize, and 32-bin
-        softmax-expectation all stay inside Robometer.
+        Each input clip is a Python-list style multi-image trajectory with the
+        locked 4 contract frames. Robometer's own collator, prompt template,
+        ``<|prog_token|>`` insertion, resize, and 32-bin softmax-expectation
+        still stay inside Robometer.
         """
         from robometer.data.dataset_types import ProgressSample, Trajectory
         from robometer.evals.eval_server import compute_batch_outputs
 
-        traj = Trajectory(
-            frames=frames_hwc,
-            frames_shape=tuple(frames_hwc.shape),
-            task=task,
-            id="0",
-            metadata={"subsequence_length": int(frames_hwc.shape[0])},
-            video_embeddings=None,
-        )
-        batch = self.collator(
-            [ProgressSample(trajectory=traj, sample_type="progress")]
-        )
+        samples = []
+        for i, frames_hwc in enumerate(frames_batch_hwc):
+            task = tasks[i] if i < len(tasks) else ""
+            traj = Trajectory(
+                frames=frames_hwc,
+                frames_shape=tuple(frames_hwc.shape),
+                task=task,
+                id=str(i),
+                metadata={"subsequence_length": int(frames_hwc.shape[0])},
+                video_embeddings=None,
+            )
+            samples.append(ProgressSample(trajectory=traj, sample_type="progress"))
+
+        batch = self.collator(samples)
         progress_inputs = batch["progress_inputs"]
         for key, value in progress_inputs.items():
             if hasattr(value, "to"):
@@ -435,11 +447,19 @@ class ProgressScorer:
             num_bins=self.num_bins,
         )
         preds = results.get("progress_pred", [])
-        return (
-            np.asarray(preds[0], dtype=np.float32)
-            if preds
-            else np.zeros(0, dtype=np.float32)
-        )
+        if len(preds) != len(samples):
+            raise ValueError(
+                f"Robometer returned {len(preds)} progress predictions for "
+                f"{len(samples)} clips"
+            )
+        return [np.asarray(p, dtype=np.float32).ravel() for p in preds]
+
+    @torch.no_grad()
+    def _robometer_progress(self, frames_hwc: np.ndarray, task: str) -> np.ndarray:
+        """One clip -> Robometer per-frame ``progress_pred`` via their own forward."""
+        return self._robometer_progress_batch(
+            np.expand_dims(frames_hwc, axis=0), [task]
+        )[0]
 
     @torch.no_grad()
     def score(self, dream_rgb: torch.Tensor, language: list) -> dict[str, Any]:
@@ -461,18 +481,29 @@ class ProgressScorer:
         frames = self._candidate_frames(dream_rgb)  # [K, B, 4, H, W, 3] uint8
         k, b, n_sent = frames.shape[0], frames.shape[1], frames.shape[2]
         lang = list(language)
-        preds = np.zeros((k, b, n_sent), dtype=np.float32)
-        for ki in range(k):
-            for bi in range(b):
-                task = lang[bi] if bi < len(lang) else ""
-                p = self._robometer_progress(frames[ki, bi], task)
+        flat_frames = frames.reshape(k * b, n_sent, *frames.shape[3:])
+        flat_tasks = [
+            lang[bi] if bi < len(lang) else "" for _ki in range(k) for bi in range(b)
+        ]
+        flat_preds = np.zeros((k * b, n_sent), dtype=np.float32)
+
+        for start in range(0, k * b, self.batch_size):
+            end = min(start + self.batch_size, k * b)
+            batch_preds = self._robometer_progress_batch(
+                flat_frames[start:end], flat_tasks[start:end]
+            )
+            for local_i, p in enumerate(batch_preds):
                 if p.shape[0] != n_sent:
+                    flat_i = start + local_i
+                    ki, bi = divmod(flat_i, b)
                     raise ValueError(
                         f"Robometer returned {p.shape[0]} progress values for "
                         f"{n_sent} sent frames (candidate k={ki}, b={bi}); the "
                         "collator subsampled -- check the frame contract (§2)."
                     )
-                preds[ki, bi] = p
+                flat_preds[start + local_i] = p
+
+        preds = flat_preds.reshape(k, b, n_sent)
 
         # r_progress = mean(future) − anchor; signed, added directly (not through
         # _bounded). progress_pred ∈ [0, 1], so reward ∈ [-1, 1].
@@ -514,7 +545,7 @@ class DreamZeroPRM:
     ``bok_exec_lambda``, ``bok_cons_lambda``, ``bok_cons_arm_w``,
     ``bok_cons_grip_w``; and for progress ``bok_progress_model_path``
     (Robometer-4B-LIBERO checkpoint dir), ``bok_progress_device``,
-    ``bok_prog_lambda``.
+    ``bok_prog_lambda``, ``bok_progress_batch_size``.
     """
 
     #: EVA's bounded score mapping (logged only; argmin of penalty is the
@@ -562,7 +593,14 @@ class DreamZeroPRM:
                 _load_robometer_progress(
                     str(prog_path),
                     str(getattr(config, "bok_progress_device", "cuda")),
-                )
+                ),
+                batch_size=int(
+                    getattr(
+                        config,
+                        "bok_progress_batch_size",
+                        DEFAULT_ROBOMETER_PROGRESS_BATCH_SIZE,
+                    )
+                ),
             )
 
     def _bounded(self, penalty):
