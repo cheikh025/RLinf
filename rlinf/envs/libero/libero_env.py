@@ -96,6 +96,9 @@ class LiberoEnv(gym.Env):
         self.task_id_filter = cfg.get("task_id_filter", None)
         if self.task_id_filter is not None:
             self.task_id_filter = list(self.task_id_filter)
+        self.reset_state_id_filter = cfg.get("reset_state_id_filter", None)
+        if self.reset_state_id_filter is not None:
+            self.reset_state_id_filter = list(self.reset_state_id_filter)
 
         self.ignore_terminations = cfg.ignore_terminations
         self.auto_reset = cfg.auto_reset
@@ -371,7 +374,25 @@ class LiberoEnv(gym.Env):
             self.total_num_group_envs += task_num_trials
         self.cumsum_trial_id_bins = np.cumsum(self.trial_id_bins)
 
-        if self.task_id_filter is not None:
+        if self.reset_state_id_filter is not None:
+            total = self.total_num_group_envs
+            validated_rids = []
+            for rid in self.reset_state_id_filter:
+                if not isinstance(rid, (int, np.integer)):
+                    raise ValueError(
+                        f"reset_state_id_filter must contain ints, got "
+                        f"{type(rid).__name__}: {rid}"
+                    )
+                rid_int = int(rid)
+                if rid_int < 0 or rid_int >= total:
+                    raise ValueError(
+                        f"reset_state_id {rid_int} in reset_state_id_filter is "
+                        f"out of range [0, {total - 1}]"
+                    )
+                validated_rids.append(rid_int)
+            validated_rids = sorted(set(validated_rids))
+            self._valid_reset_state_ids = np.array(validated_rids)
+        elif self.task_id_filter is not None:
             num_tasks = len(self.trial_id_bins)
             validated_tids = []
             for tid in self.task_id_filter:
