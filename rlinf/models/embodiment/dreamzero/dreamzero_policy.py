@@ -382,16 +382,10 @@ class DreamZeroPolicy(VLA, BasePolicy):
         base_seed = original_seed if base_seed is None else int(base_seed)
 
         need_cons = self._cons_dreams_needed()
-        # A latent IDM consumes ``video_pred`` directly (no decode); a pixel IDM
-        # needs the decoded RGB canvas. The kind is auto-detected by the PRM
-        # from the IDM checkpoint (see DreamZeroPRM / _load_consistency_idm).
-        uses_latent = bool(
-            need_cons and getattr(self._ensure_prm(), "cons_uses_latent", False)
-        )
         need_prog = self._prog_dreams_needed()
         candidates = []
         seeds = []
-        cons_inputs = []  # per-candidate IDM inputs: raw latents or decoded RGB
+        cons_inputs = []  # per-candidate decoded RGB canvases for the IDM
         prog_dreams = []  # per-candidate decoded RGB canvases for the progress term
         try:
             for k in range(num_candidates):
@@ -402,18 +396,14 @@ class DreamZeroPolicy(VLA, BasePolicy):
                 candidates.append(pred)
                 seeds.append(seed)
                 video_pred = pred.get("video_pred")
-                # Decode the dream once per candidate when something needs RGB:
-                # the pixel-IDM consistency term and/or the progress term (which
-                # always scores decoded RGB, independent of the IDM kind). The
-                # decode is reused by the save hook so a chunk is never decoded
-                # twice. A latent IDM consumes the raw ``video_pred`` directly.
+                # Decode the dream once per candidate when the pixel-IDM
+                # consistency term and/or the progress term needs RGB. The decode
+                # is reused by the save hook so a chunk is never decoded twice.
                 decoded = None
-                if video_pred is not None and (
-                    need_prog or (need_cons and not uses_latent)
-                ):
+                if video_pred is not None and (need_prog or need_cons):
                     decoded = self._decode_dream(video_pred)
-                if need_cons and video_pred is not None:
-                    cons_inputs.append(video_pred if uses_latent else decoded)
+                if need_cons and decoded is not None:
+                    cons_inputs.append(decoded)
                 if need_prog and decoded is not None:
                     prog_dreams.append(decoded)
                 self._maybe_save_video_pred(
@@ -441,7 +431,6 @@ class DreamZeroPolicy(VLA, BasePolicy):
         chosen_index, select_info = self._select_candidate(
             env_actions,
             cons_inputs if need_cons else None,
-            uses_latent,
             prog_dreams if need_prog else None,
             obs,
         )
@@ -589,7 +578,6 @@ class DreamZeroPolicy(VLA, BasePolicy):
         self,
         env_actions: list,
         cons_inputs: Optional[list] = None,
-        uses_latent: bool = False,
         prog_dreams: Optional[list] = None,
         obs: Optional[dict] = None,
     ) -> tuple[Any, Optional[dict]]:
@@ -604,8 +592,7 @@ class DreamZeroPolicy(VLA, BasePolicy):
 
         When ``bok_prm_terms`` includes ``consistency``, ``cons_inputs`` (the
         per-candidate IDM inputs prepared in ``_predict_best_of_k``) are passed
-        in ``context["dream_input"]`` -- raw WAM video latents when
-        ``uses_latent`` (latent IDM), otherwise the decoded RGB canvases split
+        in ``context["dream_input"]`` after splitting the decoded RGB canvases
         into the IDM's per-view layout.
 
         When a progress checkpoint is configured (``bok_progress_model_path``),
@@ -626,18 +613,14 @@ class DreamZeroPolicy(VLA, BasePolicy):
         context = {}
         if self._bok_prev_action is not None:
             context["prev_action"] = self._bok_prev_action
-        # Consistency term input. Latent IDM: stack the raw WAM video latents
-        # [B, C, T, H, W] -> [K, B, C, T, H, W]. Pixel IDM: split each decoded
-        # canvas into the per-view layout -> [K, B, V, F, 3, H, W/2].
+        # Consistency term input: split each decoded canvas into the per-view
+        # layout -> [K, B, V, F, 3, H, W/2].
         if self._bok_prm.cons_scorer is not None and cons_inputs:
-            if uses_latent:
-                context["dream_input"] = torch.stack(cons_inputs, dim=0)
-            else:
-                from rlinf.models.embodiment.dreamzero.idm.model import split_canvas
+            from rlinf.models.embodiment.dreamzero.idm.model import split_canvas
 
-                context["dream_input"] = torch.stack(
-                    [split_canvas(d) for d in cons_inputs], dim=0
-                )
+            context["dream_input"] = torch.stack(
+                [split_canvas(d) for d in cons_inputs], dim=0
+            )
         # Progress term input: per-candidate dreams split into exterior/wrist
         # views -> [K, B, V, F, 3, H, W], plus the task language. Only when a
         # progress model is loaded.

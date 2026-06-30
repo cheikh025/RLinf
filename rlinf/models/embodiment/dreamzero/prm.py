@@ -172,9 +172,8 @@ class ConsistencyScorer:
 
     For each best-of-K candidate, the IDM -- trained to invert a dreamed clip
     back to the action chunk that produced it -- predicts actions from the
-    dream (decoded RGB for a pixel IDM, or the raw WAM video latent for a
-    latent IDM); the penalty is the distance to the WAM's predicted actions
-    on the 7 env dims: arm SmoothL1 in the IDM's *standardized* units (so
+    decoded RGB dream; the penalty is the distance to the WAM's predicted
+    actions on the 7 env dims: arm SmoothL1 in the IDM's *standardized* units (so
     translation does not drown rotation) plus gripper sign disagreement. Low
     penalty = video and actions tell the same story (internally coherent); a
     high penalty flags a candidate whose two heads disagree.
@@ -207,10 +206,9 @@ class ConsistencyScorer:
 
         Args:
             env_actions: ``[K, B, T, D]`` env-space WAM actions (gripper last).
-            dream_input: ``[K, B, ...]`` per-candidate IDM input -- the decoded
-                dream in split-canvas layout ``[K, B, V, F, 3, H, W]`` for a
-                pixel IDM, or the raw WAM video latent ``[K, B, C, T, H, W]``
-                for a latent IDM. The trailing dims are fed to the IDM as-is.
+            dream_input: decoded dream in split-canvas layout
+                ``[K, B, V, F, 3, H, W]``. The trailing dims are fed to the IDM
+                as-is.
 
         Returns:
             ``*_per_env`` matrices shaped ``[K, B]``. For ``B == 1``, flat
@@ -249,14 +247,11 @@ class ConsistencyScorer:
 
 
 def _load_consistency_idm(path: str, device: str):
-    """Load the consistency IDM, auto-detecting pixel vs latent.
+    """Load the pixel consistency IDM.
 
-    The checkpoint's ``idm_cfg`` distinguishes them: a latent config
-    (:class:`...idm.latent_model.LatentIDMConfig`) carries ``latent_channels``,
-    a pixel config (:class:`...idm.model.IDMConfig`) does not. Returns
-    ``(model, is_latent)``; the model is frozen, eval, fp32. Resolves a
-    checkpoint directory the same way as the ``from_checkpoint`` helpers
-    (``best.pt`` > ``final.pt`` > ``latest.pt``).
+    Resolves a checkpoint directory the same way as ``IDM.from_checkpoint``
+    (``best.pt`` > ``final.pt`` > ``latest.pt``). The returned model is frozen,
+    eval, fp32.
     """
     import os
 
@@ -276,22 +271,13 @@ def _load_consistency_idm(path: str, device: str):
         raise KeyError(
             f"IDM checkpoint {ckpt_path!r} missing 'idm_cfg'/'model'."
         )
+    from rlinf.models.embodiment.dreamzero.idm.model import IDM, IDMConfig
+
     cfg = ckpt["idm_cfg"]
-    is_latent = "latent_channels" in cfg
-    if is_latent:
-        from rlinf.models.embodiment.dreamzero.idm.latent_model import (
-            LatentActionIDM,
-            LatentIDMConfig,
-        )
-
-        model = LatentActionIDM(LatentIDMConfig(**cfg))
-    else:
-        from rlinf.models.embodiment.dreamzero.idm.model import IDM, IDMConfig
-
-        model = IDM(IDMConfig(**cfg))
+    model = IDM(IDMConfig(**cfg))
     model.load_state_dict(ckpt["model"])
     model = model.eval().to(device=device, dtype=torch.float32).requires_grad_(False)
-    return model, is_latent
+    return model
 
 
 def _load_robometer_progress(path: str, device: str):
@@ -645,7 +631,6 @@ class DreamZeroPRM:
         # Optional cycle-consistency term. Built only when requested by
         # ``bok_prm_terms``.
         self.cons_scorer = None
-        self.cons_uses_latent = False
         idm_path = getattr(config, "bok_idm_model_path", None)
         if self.uses_consistency:
             if not _config_value_is_set(idm_path):
@@ -653,7 +638,7 @@ class DreamZeroPRM:
                     "bok_prm_terms includes 'consistency' but "
                     "bok_idm_model_path is not set."
                 )
-            idm, self.cons_uses_latent = _load_consistency_idm(
+            idm = _load_consistency_idm(
                 str(idm_path),
                 str(getattr(config, "bok_idm_device", "cuda")),
             )
