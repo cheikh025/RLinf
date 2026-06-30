@@ -77,6 +77,7 @@ class DreamZeroPolicy(VLA, BasePolicy):
         # Lazily-seeded RNG for the random-selection control baseline
         # (bok_selector=random); see _select_random.
         self._bok_random_rng = None
+        self._bok_exec_alias_warned = False
 
     # This method is called in FSDPModelManager.setup_model_and_optimizer
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs={}):
@@ -357,17 +358,18 @@ class DreamZeroPolicy(VLA, BasePolicy):
         resets the head's stream state (``current_start_frame``/KV caches) at
         the start of every call, so the K samplings are independent.
 
-        Which candidate is executed depends on ``bok_selector``: "first"
-        (default) always executes candidate 0 (baseline behavior); "random"
-        picks one uniformly at random per env (control baseline, see
-        ``_select_random``); "exec" delegates to the executability PRM (see
-        ``rlinf.models.embodiment.dreamzero.prm`` and ``_select_candidate``).
-        All candidates are saved/logged for diversity verification.
+        Which candidate is executed depends on ``bok_selector``: "random" picks
+        one uniformly at random per env (control baseline, see
+        ``_select_random``); "prm" delegates to the weighted PRM terms in
+        ``bok_prm_terms`` (see ``rlinf.models.embodiment.dreamzero.prm`` and
+        ``_select_candidate``). Candidate-0 baseline runs should use
+        ``best_of_k=1`` and skip this path. All candidates are saved/logged for
+        diversity verification.
 
         Enabled with ``actor.model.best_of_k`` > 1. Optional:
         ``bok_base_seed`` (default: the head's own seed), ``bok_output_dir``
         (default "dreamzero_best_of_k") for the diversity jsonl,
-        ``bok_selector`` and the ``bok_exec_w_*`` PRM knobs.
+        ``bok_selector``, ``bok_prm_terms``, and the PRM knobs.
         """
         action_head = self.action_head
         if not hasattr(action_head, "seed"):
@@ -463,38 +465,34 @@ class DreamZeroPolicy(VLA, BasePolicy):
 
     def _cons_dreams_needed(self) -> bool:
         """Whether best-of-K must prepare the consistency input this call: only
-        when the exec selector is active and an IDM checkpoint is configured
-        (``bok_idm_model_path``). The input is the raw ``video_pred`` latent
-        for a latent IDM (no decode) or the decoded RGB canvas for a pixel IDM;
-        either way it is always-on here, independent of ``save_video_pred``
-        (whose own decode is separately capped).
+        when the PRM selector is active and ``bok_prm_terms`` includes
+        ``consistency``. The input is the raw ``video_pred`` latent for a latent
+        IDM (no decode) or the decoded RGB canvas for a pixel IDM; either way it
+        is always-on here, independent of ``save_video_pred`` (whose own decode
+        is separately capped).
         """
-        selector = str(
-            getattr(self.config, "bok_selector", "first") or "first"
-        ).lower()
-        if selector != "exec":
+        if self._bok_selector() != "prm":
             return False
-        return bool(getattr(self.config, "bok_idm_model_path", None))
+        return bool(self._ensure_prm().uses_consistency)
 
     def _prog_dreams_needed(self) -> bool:
         """Whether best-of-K must decode dreams for the progress term this call:
-        only when the exec selector is active and a progress checkpoint is
-        configured (``bok_progress_model_path``). The progress model always
-        scores decoded RGB dreams, independent of the IDM's pixel/latent kind.
+        only when the PRM selector is active and ``bok_prm_terms`` includes
+        ``progress``. The progress model always scores decoded RGB dreams,
+        independent of the IDM's pixel/latent kind.
         """
-        selector = str(
-            getattr(self.config, "bok_selector", "first") or "first"
-        ).lower()
-        if selector != "exec":
+        if self._bok_selector() != "prm":
             return False
-        return bool(getattr(self.config, "bok_progress_model_path", None))
+        return bool(self._ensure_prm().uses_progress)
 
     def _progress_language(self, obs: dict) -> list:
-        """Per-env instruction strings for the progress term (design §12).
+        """Per-env instruction strings for the progress term.
 
-        Robometer scores the dreamed exterior frames directly (anchor = dream
-        frame 0), so the only conditioning it needs is the verbatim LIBERO
-        instruction, pulled from the converted obs by the language key.
+        Robometer scores the dreamed exterior frames directly, and the current
+        PRM progress term uses the last Robometer progress prediction as the
+        candidate value. The only non-visual conditioning it needs is the
+        verbatim LIBERO instruction, pulled from the converted obs by the
+        language key.
         """
         language = obs.get(self._language_key)
         if language is None:
@@ -557,6 +555,36 @@ class DreamZeroPolicy(VLA, BasePolicy):
             self._bok_prm = DreamZeroPRM(self.config)
         return self._bok_prm
 
+    def _bok_selector(self) -> str:
+        """Return the explicit best-of-K selector for ``best_of_k > 1``."""
+        raw_selector = getattr(self.config, "bok_selector", None)
+        if raw_selector is None or str(raw_selector).strip() == "":
+            raise ValueError(
+                "actor.model.best_of_k > 1 requires actor.model.bok_selector "
+                "to be 'random' or 'prm'. Use actor.model.best_of_k=1 for the "
+                "candidate-0 baseline."
+            )
+
+        selector = str(raw_selector).lower()
+        if selector == "exec":
+            if not self._bok_exec_alias_warned:
+                logger.warning(
+                    "bok_selector='exec' is deprecated; use bok_selector='prm' "
+                    "with bok_prm_terms instead."
+                )
+                self._bok_exec_alias_warned = True
+            return "prm"
+        if selector == "first":
+            raise ValueError(
+                "bok_selector='first' is no longer supported for best_of_k > 1. "
+                "Use actor.model.best_of_k=1 for the candidate-0 baseline."
+            )
+        if selector not in ("random", "prm"):
+            raise ValueError(
+                f"Unknown bok_selector {selector!r}; use 'random' or 'prm'."
+            )
+        return selector
+
     def _select_candidate(
         self,
         env_actions: list,
@@ -567,37 +595,31 @@ class DreamZeroPolicy(VLA, BasePolicy):
     ) -> tuple[Any, Optional[dict]]:
         """Pick which best-of-K candidate to execute.
 
-        ``bok_selector`` (Hydra ``+actor.model.bok_selector``): "first"
-        (default) always executes candidate 0 — exact baseline behavior;
-        "random" picks one candidate uniformly at random per env (the
-        control baseline that isolates the value of the selection metric, see
-        ``_select_random``); "exec" ranks candidates with the PRM
-        (:class:`rlinf.models.embodiment.dreamzero.prm.DreamZeroPRM`),
-        passing the previous executed action for the cross-chunk seam term.
+        ``bok_selector`` (Hydra ``+actor.model.bok_selector``): "random" picks
+        one candidate uniformly at random per env (the control baseline that
+        isolates the value of the selection metric, see ``_select_random``);
+        "prm" ranks candidates with the configured PRM terms
+        (:class:`rlinf.models.embodiment.dreamzero.prm.DreamZeroPRM`). The
+        candidate-0 baseline is ``best_of_k=1`` and does not enter this method.
 
-        When an IDM checkpoint is configured (``bok_idm_model_path``), the PRM
-        also scores cycle-consistency; ``cons_inputs`` (the per-candidate IDM
-        inputs prepared in ``_predict_best_of_k``) are passed in
-        ``context["dream_input"]`` -- raw WAM video latents when
+        When ``bok_prm_terms`` includes ``consistency``, ``cons_inputs`` (the
+        per-candidate IDM inputs prepared in ``_predict_best_of_k``) are passed
+        in ``context["dream_input"]`` -- raw WAM video latents when
         ``uses_latent`` (latent IDM), otherwise the decoded RGB canvases split
-        into the IDM's per-view layout. Without an IDM, ``cons_inputs`` is
-        ``None`` and selection is executability-only.
+        into the IDM's per-view layout.
 
         When a progress checkpoint is configured (``bok_progress_model_path``),
         the per-candidate decoded dreams ``prog_dreams`` and the current ``obs``
-        are passed in ``context["progress"]`` (design §12) -- the dreams split
-        into per-view RGB, plus the verbatim instruction language -- so the PRM
-        adds the signed Robometer progress reward term.
+        are passed in ``context["progress"]`` -- the dreams split into per-view
+        RGB, plus the verbatim instruction language -- so the PRM adds the
+        Robometer last-frame progress reward term.
         """
-        selector = str(getattr(self.config, "bok_selector", "first") or "first")
-        selector = selector.lower()
-        if selector == "first":
-            return 0, None
+        selector = self._bok_selector()
         if selector == "random":
             return self._select_random(env_actions)
-        if selector != "exec":
+        if selector != "prm":
             raise ValueError(
-                f"Unknown bok_selector {selector!r}; use 'first', 'random', or 'exec'."
+                f"Unknown bok_selector {selector!r}; use 'random' or 'prm'."
             )
         self._ensure_prm()
         env_stack = torch.as_tensor(np.stack(env_actions), dtype=torch.float32)
@@ -616,10 +638,14 @@ class DreamZeroPolicy(VLA, BasePolicy):
                 context["dream_input"] = torch.stack(
                     [split_canvas(d) for d in cons_inputs], dim=0
                 )
-        # Progress term input (design §12): per-candidate dreams split into
-        # exterior/wrist views -> [K, B, V, F, 3, H, W], plus the raw
-        # conditioning frame and language. Only when a progress model is loaded.
-        if self._bok_prm.prog_scorer is not None and prog_dreams and obs is not None:
+        # Progress term input: per-candidate dreams split into exterior/wrist
+        # views -> [K, B, V, F, 3, H, W], plus the task language. Only when a
+        # progress model is loaded.
+        if (
+            self._bok_prm.prog_scorer is not None
+            and prog_dreams
+            and obs is not None
+        ):
             from rlinf.models.embodiment.dreamzero.idm.model import split_canvas
 
             dream_rgb = torch.stack([split_canvas(d) for d in prog_dreams], dim=0)
@@ -629,32 +655,25 @@ class DreamZeroPolicy(VLA, BasePolicy):
         chosen_per_env = info.get("chosen_index_per_env")
         num_envs = len(chosen_per_env) if isinstance(chosen_per_env, list) else 1
         if num_envs > 1:
+            def _shape(key):
+                return list(np.asarray(info[key]).shape) if key in info else None
+
             logger.info(
-                "[dreamzero best-of-k] call %d: selector=exec chose per-env "
-                "candidates (num_envs=%d, chosen_counts=%s, "
+                "[dreamzero best-of-k] call %d: selector=prm chose per-env "
+                "candidates (num_envs=%d, prm_terms=%s, chosen_counts=%s, "
                 "exec_pen_per_env_shape=%s, exec_score_per_env_shape=%s, "
                 "cons_pen_per_env_shape=%s, cons_score_per_env_shape=%s, "
-                "combined_per_env_shape=%s)",
+                "progress_per_env_shape=%s, combined_per_env_shape=%s)",
                 self._bok_call_count,
                 num_envs,
+                info.get("prm_terms"),
                 info.get("chosen_counts"),
-                list(np.asarray(info["penalty_per_env"]).shape),
-                list(np.asarray(info["exec_score_per_env"]).shape),
-                (
-                    list(np.asarray(info["cons_penalty_per_env"]).shape)
-                    if "cons_penalty_per_env" in info
-                    else None
-                ),
-                (
-                    list(np.asarray(info["cons_score_per_env"]).shape)
-                    if "cons_score_per_env" in info
-                    else None
-                ),
-                (
-                    list(np.asarray(info["combined_score_per_env"]).shape)
-                    if "combined_score_per_env" in info
-                    else None
-                ),
+                _shape("penalty_per_env"),
+                _shape("exec_score_per_env"),
+                _shape("cons_penalty_per_env"),
+                _shape("cons_score_per_env"),
+                _shape("progress_reward_per_env"),
+                _shape("combined_score_per_env"),
             )
         else:
             exec_pen = info.get("exec_penalty")
@@ -664,11 +683,12 @@ class DreamZeroPolicy(VLA, BasePolicy):
             if exec_score is None:
                 exec_score = info.get("score", [])
             logger.info(
-                "[dreamzero best-of-k] call %d: selector=exec chose candidate %s "
-                "(chosen_counts=%s, exec_pen=%s, exec_score=%s, cons_pen=%s, "
-                "cons_score=%s, combined=%s)",
+                "[dreamzero best-of-k] call %d: selector=prm chose candidate %s "
+                "(prm_terms=%s, chosen_counts=%s, exec_pen=%s, exec_score=%s, "
+                "cons_pen=%s, cons_score=%s, progress=%s, combined=%s)",
                 self._bok_call_count,
                 chosen,
+                info.get("prm_terms"),
                 info.get("chosen_counts"),
                 [round(float(p), 6) for p in exec_pen],
                 [round(float(s), 6) for s in exec_score],
@@ -683,6 +703,11 @@ class DreamZeroPolicy(VLA, BasePolicy):
                     else None
                 ),
                 (
+                    [round(float(s), 6) for s in info["progress_reward"]]
+                    if "progress_reward" in info
+                    else None
+                ),
+                (
                     [round(float(s), 6) for s in info["combined_score"]]
                     if "combined_score" in info
                     else None
@@ -694,11 +719,11 @@ class DreamZeroPolicy(VLA, BasePolicy):
         """Best-of-K control baseline: pick one candidate uniformly at random.
 
         ``bok_selector=random``. The K candidates are generated exactly as for
-        the PRM selectors (same seeds, same diversity), but the choice ignores
+        ``bok_selector=prm`` (same seeds, same diversity), but the choice ignores
         every score — no PRM, no IDM, no dream decode. This isolates the value
         of the selection *metric* from the value of merely having K samples:
-        compare its success rate against ``bok_selector=exec`` (consistency +
-        executability) and ``first`` (candidate 0). The choice is made per env.
+        compare its success rate against PRM arms and the ``best_of_k=1``
+        candidate-0 baseline. The choice is made per env.
 
         Reproducible via ``bok_random_seed`` (default 0); the RNG is created
         once and advances deterministically across calls, so a rerun with the
@@ -729,7 +754,7 @@ class DreamZeroPolicy(VLA, BasePolicy):
             chosen_counts,
             seed,
         )
-        # Scalar for the single-env case (matches "first"); per-env list otherwise.
+        # Scalar for the single-env case; per-env list otherwise.
         chosen_index = int(chosen[0]) if num_envs == 1 else chosen.tolist()
         return chosen_index, info
 

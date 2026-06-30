@@ -295,14 +295,17 @@ def _load_consistency_idm(path: str, device: str):
 
 
 def _load_robometer_progress(path: str, device: str):
-    """Load the frozen Robometer reward model for PRM progress scoring (§10).
+    """Load the frozen Robometer reward model for PRM progress scoring.
 
     In-process load via Robometer's own ``load_model_from_hf`` (NOT a full
     ``pip install -e .`` -- see ``dreamzero_robometer_combined_env_README.md``);
     imports are lazy so this module still imports where Robometer is absent
     (exec-only / non-progress runs). Returns a bundle of the frozen model +
-    collator + the discrete-progress decode settings the scorer needs, mirroring
-    ``scripts/example_inference_local.py``.
+    collator + the settings the canonical last-frame chain needs:
+    ``max_frames`` (read from the checkpoint's ``data.max_frames``) and
+    ``model_type`` (``model.model_type``), plus the discrete-progress decode
+    settings -- so ``raw_dict_to_sample`` / ``process_batch_helper`` /
+    ``extract_rewards_from_output`` run exactly as in the LIBERO reward wrapper.
     """
     import torch as _torch
 
@@ -327,6 +330,18 @@ def _load_robometer_progress(path: str, device: str):
     num_bins = getattr(loss_config, "progress_discrete_bins", None) or getattr(
         exp_config.model, "progress_discrete_bins", 10
     )
+
+    # Frame budget + model type for Robometer's own inference chain. ``max_frames``
+    # comes straight from the checkpoint (for example, 4 for
+    # aliangdw/Robometer-4B-LIBERO and 8 for robometer/Robometer-4B) -- no literal
+    # here. ``model_type`` is required by ``process_batch_helper``.
+    data_config = getattr(exp_config, "data", None)
+    max_frames = int(getattr(data_config, "max_frames", 8))
+    model_type = getattr(getattr(exp_config, "model", None), "model_type", None)
+    if model_type is None:
+        raise ValueError(
+            "Robometer exp_config.model.model_type is required for progress scoring"
+        )
     return {
         "model": reward_model,
         "tokenizer": tokenizer,
@@ -334,42 +349,115 @@ def _load_robometer_progress(path: str, device: str):
         "device": dev,
         "is_discrete": bool(is_discrete),
         "num_bins": int(num_bins),
+        "max_frames": max_frames,
+        "model_type": model_type,
     }
 
 
-#: Locked Phase-2 frame contract
-#: (``dreamzero_robometer_progress_phase2_input_contract_README.md`` §2): of the
-#: F=9 dream frames (0 = conditioning ô_t, 1..8 dreamed) send exactly 4 -- anchor
-#: + 3 evenly-spanned futures (env offsets 0/9/18/24) -- so Robometer's collator
-#: does no internal subsample and we know which progress_pred is anchor vs future.
-ROBOMETER_FRAME_INDICES = (0, 3, 6, 8)
+#: The decoded dream is F=9 frames: index 0 is the conditioning frame ô_t (the
+#: real current observation, NOT dreamed) and indices 1..8 are the 8 dreamed
+#: future frames. We score the 8 dreamed frames as the candidate trajectory and
+#: hand all 8 to Robometer. Robometer then applies the checkpoint's own
+#: ``data.max_frames`` setting (LIBERO is 4, so it subsamples internally). The
+#: last Robometer progress prediction is the candidate value.
+DREAMED_FRAME_START = 1
+DREAMED_FRAME_COUNT = 8
 DEFAULT_ROBOMETER_PROGRESS_BATCH_SIZE = 50
 
 
+PRM_TERM_ALIASES = {
+    "exec": "exec",
+    "executability": "exec",
+    "cons": "consistency",
+    "consistency": "consistency",
+    "idm": "consistency",
+    "progress": "progress",
+    "prog": "progress",
+    "robometer": "progress",
+}
+PRM_TERM_ORDER = ("exec", "consistency", "progress")
+
+
+def _config_value_is_set(value: Any) -> bool:
+    return value is not None and str(value).strip().lower() not in ("", "none", "null")
+
+
+def _split_prm_terms(raw_terms: Any) -> list[str]:
+    if isinstance(raw_terms, str):
+        terms = raw_terms.strip()
+        if terms.startswith("[") and terms.endswith("]"):
+            terms = terms[1:-1]
+        return [
+            item.strip()
+            for item in terms.replace(";", ",").split(",")
+            if item.strip()
+        ]
+    try:
+        return [str(item).strip() for item in raw_terms if str(item).strip()]
+    except TypeError:
+        return [str(raw_terms).strip()]
+
+
+def _auto_prm_terms(config: Any) -> tuple[str, ...]:
+    terms = ["exec"]
+    if _config_value_is_set(getattr(config, "bok_idm_model_path", None)):
+        terms.append("consistency")
+    if _config_value_is_set(getattr(config, "bok_progress_model_path", None)):
+        terms.append("progress")
+    return tuple(terms)
+
+
+def _normalize_prm_terms(config: Any) -> tuple[str, ...]:
+    raw_terms = getattr(config, "bok_prm_terms", None)
+    if raw_terms is None:
+        return _auto_prm_terms(config)
+
+    if isinstance(raw_terms, str) and raw_terms.strip().lower() == "auto":
+        return _auto_prm_terms(config)
+
+    requested = _split_prm_terms(raw_terms)
+    if len(requested) == 1 and requested[0].lower() == "all":
+        requested = list(PRM_TERM_ORDER)
+
+    terms = []
+    for term in requested:
+        normalized = PRM_TERM_ALIASES.get(term.lower())
+        if normalized is None:
+            valid = ", ".join(PRM_TERM_ORDER)
+            raise ValueError(
+                f"Unknown bok_prm_terms entry {term!r}; expected one of: {valid}."
+            )
+        if normalized not in terms:
+            terms.append(normalized)
+
+    if not terms:
+        raise ValueError("bok_prm_terms must contain at least one PRM term.")
+    return tuple(term for term in PRM_TERM_ORDER if term in terms)
+
+
 class ProgressScorer:
-    """Signed progress reward ``r_progress`` for best-of-K candidates (§10).
+    """Last-frame progress reward ``r_progress`` for best-of-K candidates.
 
     Scores each candidate's dreamed future with the frozen **Robometer** reward
-    model (``aliangdw/Robometer-4B-LIBERO``) and returns the advance toward task
-    completion relative to the dreamed conditioning frame::
+    model (``aliangdw/Robometer-4B-LIBERO``) through Robometer's OWN canonical
+    inference chain -- exactly the LIBERO reward-wrapper path::
 
-        r_progress(c_k, l) = mean(p1, p2, p3) − p0
+        raw_dict_to_sample(frames, max_frames)            # Robometer linspace-subsample
+            -> process_batch_helper(use_frame_steps=False)   # one forward, no 4-frame steps
+                -> extract_rewards_from_output            # last-frame progress, clamp [0, 1]
 
-    where ``[p0, p1, p2, p3]`` are Robometer's per-frame ``progress_pred`` on the
-    4 sent frames: the exterior view, hflipped to Robometer orientation, at dream
-    indices ``[0, 3, 6, 8]`` (frame 0 = anchor ô_t). Pixels and prompt cross the
-    boundary into Robometer's OWN loader / collator / template / forward -- we
-    never re-implement a fragment (Phase-2 governing rule). See
-    ``dreamzero_robometer_progress_phase2_input_contract_README.md``.
+    The candidate value is the last-frame progress of its 8 dreamed frames (dream
+    indices 1..8; index 0 is the conditioning ô_t and is not scored). All K
+    candidates share ô_t, so the last-frame value ranks them directly. Frames,
+    ``max_frames`` and the prompt cross into Robometer's OWN loader / collator /
+    template / forward -- we never re-implement a fragment.
 
-    ``progress_pred`` is in ``[0, 1]`` (vs SmolVLA's ``[-1, 1]``), so
-    ``bok_prog_lambda`` must be re-tuned to this range (Phase 6).
+    ``progress_pred`` (and thus the reward) is in ``[0, 1]``.
     """
 
     def __init__(
         self,
         bundle: dict,
-        frame_indices=ROBOMETER_FRAME_INDICES,
         batch_size: int = DEFAULT_ROBOMETER_PROGRESS_BATCH_SIZE,
     ):
         self.model = bundle["model"]
@@ -378,16 +466,18 @@ class ProgressScorer:
         self.device = bundle["device"]
         self.is_discrete = bundle["is_discrete"]
         self.num_bins = bundle["num_bins"]
-        self.frame_indices = tuple(int(i) for i in frame_indices)
+        self.max_frames = int(bundle["max_frames"])
+        self.model_type = bundle["model_type"]
         self.batch_size = max(1, int(batch_size))
 
     def _candidate_frames(self, dream_rgb: torch.Tensor) -> np.ndarray:
-        """``[K,B,2,F,3,H,W]`` dream -> ``[K,B,4,H,W,3]`` uint8 RGB, Robometer-ready.
+        """``[K,B,2,F,3,H,W]`` dream -> ``[K,B,8,H,W,3]`` uint8 RGB, Robometer-ready.
 
-        Exterior view only (index 0), subsample to the 4 contract frames,
-        CHW->HWC, uint8, then hflip the width axis (PI dreams are mirrored vs
-        Robometer). Wrist view (index 1) is never sent -- Robometer-4B-LIBERO is
-        single-view (agentview).
+        Exterior view only (view index 0), the 8 DREAMED frames (dream indices
+        1..8; index 0 is the conditioning ô_t, not scored), CHW->HWC, uint8, then
+        hflip the width axis (PI dreams are mirrored vs Robometer). Wrist view
+        (view index 1) is never sent -- Robometer-4B-LIBERO is single-view
+        (agentview).
         """
         dream = torch.as_tensor(dream_rgb, dtype=torch.float32)
         if dream.ndim != 7 or dream.shape[2] != 2:
@@ -395,151 +485,131 @@ class ProgressScorer:
                 f"dream_rgb must be [K, B, 2, F, 3, H, W], got {tuple(dream.shape)}"
             )
         f = dream.shape[3]
-        idx = list(self.frame_indices)
-        if max(idx) >= f:
+        need = DREAMED_FRAME_START + DREAMED_FRAME_COUNT
+        if f < need:
             raise ValueError(
-                f"frame_indices {idx} exceed F={f} dream frames"
+                f"expected F>={need} dream frames (1 conditioning + "
+                f"{DREAMED_FRAME_COUNT} dreamed), got F={f}"
             )
-        ext = dream[:, :, 0][:, :, idx]  # [K, B, 4, 3, H, W] exterior, subsampled
+        sl = slice(DREAMED_FRAME_START, DREAMED_FRAME_START + DREAMED_FRAME_COUNT)
+        ext = dream[:, :, 0][:, :, sl]  # [K, B, 8, 3, H, W] exterior, dreamed
         ext = ext.clamp(0, 255).round().to(torch.uint8)
-        ext = ext.permute(0, 1, 2, 4, 5, 3).contiguous()  # CHW -> HWC: [K,B,4,H,W,3]
+        # CHW -> HWC: [K, B, 8, H, W, 3]
+        ext = ext.permute(0, 1, 2, 4, 5, 3).contiguous()
         frames = ext.cpu().numpy()[..., ::-1, :]  # hflip width -> Robometer orient.
         return np.ascontiguousarray(frames)
 
     @torch.no_grad()
-    def _robometer_progress_batch(
+    def _last_frame_reward_batch(
         self, frames_batch_hwc: np.ndarray, tasks: list[str]
-    ) -> list[np.ndarray]:
-        """Batch of clips -> Robometer per-frame ``progress_pred`` outputs.
+    ) -> list[float]:
+        """Batch of dreamed clips -> Robometer last-frame reward, via THEIR code.
 
-        Each input clip is a Python-list style multi-image trajectory with the
-        locked 4 contract frames. Robometer's own collator, prompt template,
-        ``<|prog_token|>`` insertion, resize, and 32-bin softmax-expectation
-        still stay inside Robometer.
+        Runs Robometer's reference inference chain (the LIBERO reward wrapper):
+        ``raw_dict_to_sample`` linspace-subsamples to the checkpoint's
+        ``max_frames`` (for LIBERO, 8 dreamed frames become 4 model frames),
+        ``process_batch_helper(use_frame_steps=False)`` does one forward (no
+        prefix expansion), and ``extract_rewards_from_output`` returns the
+        last-frame progress clamped to ``[0, 1]``. Robometer's collator / prompt
+        template / ``<|prog_token|>`` insertion / resize / softmax-expectation all
+        stay inside Robometer.
         """
-        from robometer.data.dataset_types import ProgressSample, Trajectory
-        from robometer.evals.eval_server import compute_batch_outputs
+        from robometer.evals.eval_server import process_batch_helper
+        from robometer.evals.eval_utils import (
+            extract_rewards_from_output,
+            raw_dict_to_sample,
+        )
 
         samples = []
         for i, frames_hwc in enumerate(frames_batch_hwc):
             task = tasks[i] if i < len(tasks) else ""
-            traj = Trajectory(
-                frames=frames_hwc,
-                frames_shape=tuple(frames_hwc.shape),
-                task=task,
-                id=str(i),
-                metadata={"subsequence_length": int(frames_hwc.shape[0])},
-                video_embeddings=None,
+            raw = {
+                "frames": np.ascontiguousarray(frames_hwc),
+                "task": task,
+                "id": str(i),
+                "metadata": {"subsequence_length": int(frames_hwc.shape[0])},
+                "video_embeddings": None,
+                "text_embedding": None,
+            }
+            samples.append(
+                raw_dict_to_sample(
+                    raw_data=raw, max_frames=self.max_frames, sample_type="progress"
+                )
             )
-            samples.append(ProgressSample(trajectory=traj, sample_type="progress"))
 
-        batch = self.collator(samples)
-        progress_inputs = batch["progress_inputs"]
-        for key, value in progress_inputs.items():
-            if hasattr(value, "to"):
-                progress_inputs[key] = value.to(self.device)
-        results = compute_batch_outputs(
-            self.model,
-            self.tokenizer,
-            progress_inputs,
-            sample_type="progress",
+        outputs = process_batch_helper(
+            model_type=self.model_type,
+            model=self.model,
+            tokenizer=self.tokenizer,
+            batch_collator=self.collator,
+            device=self.device,
+            batch_data=[s.model_dump() for s in samples],
+            job_id=0,
             is_discrete_mode=self.is_discrete,
             num_bins=self.num_bins,
+            use_frame_steps=False,
         )
-        preds = results.get("progress_pred", [])
-        if len(preds) != len(samples):
+        rewards = extract_rewards_from_output(outputs)
+        if len(rewards) != len(samples):
             raise ValueError(
-                f"Robometer returned {len(preds)} progress predictions for "
-                f"{len(samples)} clips"
+                f"Robometer returned {len(rewards)} rewards for {len(samples)} clips"
             )
-        return [np.asarray(p, dtype=np.float32).ravel() for p in preds]
-
-    @torch.no_grad()
-    def _robometer_progress(self, frames_hwc: np.ndarray, task: str) -> np.ndarray:
-        """One clip -> Robometer per-frame ``progress_pred`` via their own forward."""
-        return self._robometer_progress_batch(
-            np.expand_dims(frames_hwc, axis=0), [task]
-        )[0]
+        return [float(r) for r in rewards]
 
     @torch.no_grad()
     def score(self, dream_rgb: torch.Tensor, language: list) -> dict[str, Any]:
-        """Per-candidate signed progress reward.
+        """Per-candidate last-frame progress reward.
 
         Args:
-            dream_rgb: ``[K, B, 2, F, 3, H, W]`` per-candidate decoded dream split
-                into exterior/wrist views, pixels in ``[0, 255]``. Frame 0 is the
-                conditioning obs ``ô_t``; frames are subsampled to the contract
-                set ``[0, 3, 6, 8]`` (anchor + 3 futures).
+            dream_rgb: ``[K, B, 2, F=9, 3, H, W]`` per-candidate decoded dream
+                split into exterior/wrist views, pixels in ``[0, 255]``. Frame 0
+                is the conditioning obs ``ô_t``; frames 1..8 are the dreamed future
+                and form the scored trajectory.
             language: list of ``B`` verbatim LIBERO instruction strings; element
                 ``b`` goes straight to Robometer's prompt template.
 
         Returns:
-            ``progress_reward_per_env`` ``[K, B]`` (signed) plus
-            ``progress_future_per_env`` and ``progress_cond_per_env`` for logging;
-            flat per-candidate lists for ``B == 1``.
+            ``progress_reward_per_env`` ``[K, B]`` -- the last-frame progress of
+            each candidate's dreamed clip, clamped ``[0, 1]``; flat per-candidate
+            list for ``B == 1``.
         """
-        frames = self._candidate_frames(dream_rgb)  # [K, B, 4, H, W, 3] uint8
+        frames = self._candidate_frames(dream_rgb)  # [K, B, 8, H, W, 3] uint8
         k, b, n_sent = frames.shape[0], frames.shape[1], frames.shape[2]
         lang = list(language)
         flat_frames = frames.reshape(k * b, n_sent, *frames.shape[3:])
         flat_tasks = [
             lang[bi] if bi < len(lang) else "" for _ki in range(k) for bi in range(b)
         ]
-        flat_preds = np.zeros((k * b, n_sent), dtype=np.float32)
+        flat_rewards = np.zeros((k * b,), dtype=np.float32)
 
         for start in range(0, k * b, self.batch_size):
             end = min(start + self.batch_size, k * b)
-            batch_preds = self._robometer_progress_batch(
-                flat_frames[start:end], flat_tasks[start:end]
+            flat_rewards[start:end] = np.asarray(
+                self._last_frame_reward_batch(
+                    flat_frames[start:end], flat_tasks[start:end]
+                ),
+                dtype=np.float32,
             )
-            for local_i, p in enumerate(batch_preds):
-                if p.shape[0] != n_sent:
-                    flat_i = start + local_i
-                    ki, bi = divmod(flat_i, b)
-                    raise ValueError(
-                        f"Robometer returned {p.shape[0]} progress values for "
-                        f"{n_sent} sent frames (candidate k={ki}, b={bi}); the "
-                        "collator subsampled -- check the frame contract (§2)."
-                    )
-                flat_preds[start + local_i] = p
 
-        preds = flat_preds.reshape(k, b, n_sent)
-
-        # r_progress = mean(future) − anchor; signed, added directly (not through
-        # _bounded). progress_pred ∈ [0, 1], so reward ∈ [-1, 1].
-        anchor = torch.as_tensor(preds[..., 0], dtype=torch.float32)  # [K, B]
-        future = torch.as_tensor(
-            preds[..., 1:].mean(axis=-1), dtype=torch.float32
-        )  # [K, B]
-        reward = future - anchor  # [K, B]
-        out = {"progress_cond_per_env": anchor.tolist()}
-        out.update(_per_env_payload("progress_future", future))
-        out.update(_per_env_payload("progress_reward", reward))
-        return out
+        reward = torch.as_tensor(flat_rewards.reshape(k, b), dtype=torch.float32)
+        return _per_env_payload("progress_reward", reward)
 
 
 class DreamZeroPRM:
     """Combine PRM terms and select which best-of-K candidate to execute.
 
-    Always scores executability (:class:`ExecutabilityScorer`). When an IDM
-    checkpoint is configured (``bok_idm_model_path``) *and* the policy passes
-    the per-candidate dream in ``context["dream_input"]`` (decoded RGB for a
-    pixel IDM, or the raw video latent for a latent IDM -- auto-detected from
-    the checkpoint), the cycle-consistency term
-    (:class:`ConsistencyScorer`) is added. When a progress checkpoint is
-    configured (``bok_progress_model_path``) *and* the policy supplies the
-    dreams + language in ``context["progress"]``, the signed progress reward
-    (:class:`ProgressScorer`, Robometer, design §10) is added too. The
-    active terms combine as ``exec_lambda * exec_score + cons_lambda *
-    cons_score + prog_lambda * r_progress``. Without any extra term it is pure
-    executability and behaves exactly as before.
+    Active terms are controlled by ``bok_prm_terms``. Supported terms are
+    ``exec``, ``consistency``, and ``progress``; aliases include ``cons``/``idm``
+    and ``prog``/``robometer``. When the key is omitted or set to ``auto``, the
+    legacy behavior is preserved: ``exec`` is active, and ``consistency`` /
+    ``progress`` are added when their checkpoint paths are configured.
 
-    Selection: pick the best candidate directly (``argmin`` penalty for
-    exec-only, ``argmax`` combined score when any extra term is on). Candidate 0
-    has no special tie-break privilege in best-of-K mode.
+    Selection is always ``argmax`` over the weighted sum of the active terms.
+    Candidate 0 has no special tie-break privilege in best-of-K mode.
 
     Config (read via ``getattr`` from the policy's ``DreamZeroConfig``, all
-    optional Hydra ``+actor.model.*`` keys): ``bok_exec_w_alim``,
+    optional Hydra ``+actor.model.*`` keys): ``bok_prm_terms``,
+    ``bok_exec_w_alim``,
     ``bok_exec_w_grip``, ``bok_exec_w_acc``, ``bok_exec_w_jerk``; for
     consistency ``bok_idm_model_path``, ``bok_idm_device``,
     ``bok_exec_lambda``, ``bok_cons_lambda``, ``bok_cons_arm_w``,
@@ -556,21 +626,33 @@ class DreamZeroPRM:
     SCORE_GAMMA = 0.5
 
     def __init__(self, config: Any = None):
-        self.exec_scorer = ExecutabilityScorer(
-            w_alim=float(getattr(config, "bok_exec_w_alim", 1.0)),
-            w_grip=float(getattr(config, "bok_exec_w_grip", 1.0)),
-            w_acc=float(getattr(config, "bok_exec_w_acc", 0.1)),
-            w_jerk=float(getattr(config, "bok_exec_w_jerk", 0.05)),
-        )
-        # Optional cycle-consistency term (Milestone 3). Built only when an IDM
-        # checkpoint is configured (``bok_idm_model_path``), so executability-
-        # only runs load no IDM and behave exactly as before.
-        self.cons_scorer = None
-        self.cons_uses_latent = False
+        self.active_terms = _normalize_prm_terms(config)
+        self.uses_exec = "exec" in self.active_terms
+        self.uses_consistency = "consistency" in self.active_terms
+        self.uses_progress = "progress" in self.active_terms
         self.exec_lambda = float(getattr(config, "bok_exec_lambda", 1.0))
         self.cons_lambda = float(getattr(config, "bok_cons_lambda", 1.0))
+
+        self.exec_scorer = None
+        if self.uses_exec:
+            self.exec_scorer = ExecutabilityScorer(
+                w_alim=float(getattr(config, "bok_exec_w_alim", 1.0)),
+                w_grip=float(getattr(config, "bok_exec_w_grip", 1.0)),
+                w_acc=float(getattr(config, "bok_exec_w_acc", 0.1)),
+                w_jerk=float(getattr(config, "bok_exec_w_jerk", 0.05)),
+            )
+
+        # Optional cycle-consistency term. Built only when requested by
+        # ``bok_prm_terms``.
+        self.cons_scorer = None
+        self.cons_uses_latent = False
         idm_path = getattr(config, "bok_idm_model_path", None)
-        if idm_path:
+        if self.uses_consistency:
+            if not _config_value_is_set(idm_path):
+                raise ValueError(
+                    "bok_prm_terms includes 'consistency' but "
+                    "bok_idm_model_path is not set."
+                )
             idm, self.cons_uses_latent = _load_consistency_idm(
                 str(idm_path),
                 str(getattr(config, "bok_idm_device", "cuda")),
@@ -581,14 +663,17 @@ class DreamZeroPRM:
                 w_grip=float(getattr(config, "bok_cons_grip_w", 1.0)),
             )
 
-        # Optional progress reward term (Milestone 4). Built only when a progress
-        # checkpoint is configured (``bok_progress_model_path``), so runs without
-        # it behave exactly as before. Mixed into the combined score with
-        # ``bok_prog_lambda`` -- the same weighted-sum scheme as the other terms.
+        # Optional progress reward term. Built only when requested by
+        # ``bok_prm_terms``.
         self.prog_scorer = None
         self.prog_lambda = float(getattr(config, "bok_prog_lambda", 1.0))
         prog_path = getattr(config, "bok_progress_model_path", None)
-        if prog_path:
+        if self.uses_progress:
+            if not _config_value_is_set(prog_path):
+                raise ValueError(
+                    "bok_prm_terms includes 'progress' but "
+                    "bok_progress_model_path is not set."
+                )
             self.prog_scorer = ProgressScorer(
                 _load_robometer_progress(
                     str(prog_path),
@@ -612,6 +697,13 @@ class DreamZeroPRM:
         """
         return self.SCORE_MAX * (1.0 + penalty / self.SCORE_P0) ** (-self.SCORE_GAMMA)
 
+    @staticmethod
+    def _add_term(
+        combined: Optional[torch.Tensor],
+        contribution: torch.Tensor,
+    ) -> torch.Tensor:
+        return contribution if combined is None else combined + contribution
+
     def select(
         self,
         env_actions: torch.Tensor,
@@ -621,9 +713,9 @@ class DreamZeroPRM:
 
         Args:
             env_actions: ``[K, B, T, D]`` env-space candidate action chunks.
-            context: optional extras; today only ``prev_action`` (``[B, D]``
-                last executed action) is used. Milestone 3 adds the dreamed
-                video here for the consistency term.
+            context: optional extras: ``prev_action`` for ``exec``,
+                ``dream_input`` for ``consistency``, and ``progress`` for
+                Robometer progress.
 
         Returns:
             ``(chosen_index, info)`` where ``chosen_index`` is an ``int`` for
@@ -632,67 +724,81 @@ class DreamZeroPRM:
             candidate lists are included only for ``B == 1``.
         """
         context = context or {}
-        terms = self.exec_scorer.score(
-            env_actions, prev_action=context.get("prev_action")
-        )
-        exec_pen_env = torch.as_tensor(terms["penalty_per_env"], dtype=torch.float32)
-        exec_score_env = self._bounded(exec_pen_env)
-        info = dict(terms)
-        info["exec_score_per_env"] = exec_score_env.tolist()
-        if exec_score_env.shape[1] == 1:
-            info["score"] = exec_score_env[:, 0].tolist()
-            info["exec_penalty"] = terms["penalty"]
-            info["exec_score"] = info["score"]
+        action_tensor = torch.as_tensor(env_actions, dtype=torch.float32)
+        if action_tensor.ndim != 4:
+            raise ValueError(
+                f"env_actions must be [K, B, T, D], got {tuple(action_tensor.shape)}"
+            )
+        k = int(action_tensor.shape[0])
+        info = {"prm_terms": list(self.active_terms)}
+        combined_env = None
 
-        # Combined score: executability, plus the lambda-weighted consistency and
-        # progress terms when configured. All point the same way (higher = better)
-        # so the winner is the argmax of the sum; with no extra term it stays the
-        # exec-only argmin penalty.
-        combined_env = self.exec_lambda * exec_score_env
-        combined = False
+        if self.uses_exec:
+            terms = self.exec_scorer.score(
+                action_tensor, prev_action=context.get("prev_action")
+            )
+            exec_pen_env = torch.as_tensor(
+                terms["penalty_per_env"], dtype=torch.float32
+            )
+            exec_score_env = self._bounded(exec_pen_env)
+            info.update(terms)
+            info["exec_score_per_env"] = exec_score_env.tolist()
+            if exec_score_env.shape[1] == 1:
+                info["score"] = exec_score_env[:, 0].tolist()
+                info["exec_penalty"] = terms["penalty"]
+                info["exec_score"] = info["score"]
+            combined_env = self._add_term(
+                combined_env, self.exec_lambda * exec_score_env
+            )
 
-        # Consistency arm: only when an IDM is loaded and the policy supplied the
-        # decoded dreams.
-        dreams = context.get("dream_input")
-        if self.cons_scorer is not None and dreams is not None:
+        if self.uses_consistency:
+            dreams = context.get("dream_input")
+            if dreams is None:
+                raise ValueError(
+                    "PRM term 'consistency' is active, but context['dream_input'] "
+                    "was not supplied."
+                )
             cons = self.cons_scorer.score(env_actions, dreams)
             cons_pen_env = torch.as_tensor(
                 cons["cons_penalty_per_env"], dtype=torch.float32
             )
             cons_score_env = self._bounded(cons_pen_env)
-            combined_env = combined_env + self.cons_lambda * cons_score_env
-            combined = True
+            combined_env = self._add_term(
+                combined_env, self.cons_lambda * cons_score_env
+            )
             info.update(cons)
             info["cons_score_per_env"] = cons_score_env.tolist()
             if cons_score_env.shape[1] == 1:
                 info["cons_score"] = cons_score_env[:, 0].tolist()
 
-        # Progress arm: only when a progress model is loaded and the policy
-        # supplied the dreams + conditioning + language. ``r_progress`` is a
-        # signed reward (design §10), added directly -- not passed through
-        # ``_bounded()``.
-        prog_ctx = context.get("progress")
-        if self.prog_scorer is not None and prog_ctx is not None:
+        if self.uses_progress:
+            prog_ctx = context.get("progress")
+            if prog_ctx is None:
+                raise ValueError(
+                    "PRM term 'progress' is active, but context['progress'] "
+                    "was not supplied."
+                )
             prog = self.prog_scorer.score(**prog_ctx)
             prog_score_env = torch.as_tensor(
                 prog["progress_reward_per_env"], dtype=torch.float32
             )
-            combined_env = combined_env + self.prog_lambda * prog_score_env
-            combined = True
+            combined_env = self._add_term(
+                combined_env, self.prog_lambda * prog_score_env
+            )
             info.update(prog)
 
-        if combined:
-            info["combined_score_per_env"] = combined_env.tolist()
-            if combined_env.shape[1] == 1:
-                info["combined_score"] = combined_env[:, 0].tolist()
-            chosen_tensor = torch.argmax(combined_env, dim=0)
-        else:
-            chosen_tensor = torch.argmin(exec_pen_env, dim=0)
+        if combined_env is None:
+            raise ValueError("No active PRM terms were scored.")
+
+        info["combined_score_per_env"] = combined_env.tolist()
+        if combined_env.shape[1] == 1:
+            info["combined_score"] = combined_env[:, 0].tolist()
+        chosen_tensor = torch.argmax(combined_env, dim=0)
 
         chosen_per_env = chosen_tensor.cpu().tolist()
         info["chosen_index_per_env"] = chosen_per_env
         info["chosen_counts"] = torch.bincount(
-            chosen_tensor.cpu(), minlength=exec_pen_env.shape[0]
+            chosen_tensor.cpu(), minlength=k
         ).tolist()
         chosen = chosen_per_env[0] if len(chosen_per_env) == 1 else chosen_per_env
         info["chosen_index"] = chosen
