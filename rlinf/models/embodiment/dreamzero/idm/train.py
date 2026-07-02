@@ -23,14 +23,16 @@ Run on the GPU box inside the dreamzero venv:
 
 Recipe (design record: ``dreamzero_prm_milestone3_idm_README.md``):
 AdamW + cosine with warmup, bf16 autocast, grad clip 1.0;
-loss = SmoothL1(beta=0.1, standardized arm) + lambda_grip * weighted BCE.
-Arm standardization stats and the gripper ``pos_weight`` are computed once
+loss = MSE(standardized arm) + lambda_grip * weighted BCE. The IDM predicts
+the full 24-action chunk covering the 9-frame window's 24-step span; the
+consistency scorer uses only the first 16 (the WAM chunk). Arm
+standardization stats and the gripper ``pos_weight`` are computed once
 from the train split and baked into the model buffers / checkpoint.
 
 Validation reports the Gate-1 dashboard: per-dim env-space RMSE, binary
 gripper accuracy, and the jerk ratio (predicted / ground-truth RMS of the
 second action difference) -- the regression-to-the-mean alarm: a ratio well
-below 1 means the IDM over-smooths and ``--arm-beta`` / ``--lambda-grip``
+below 1 means the IDM over-smooths and ``--lambda-grip`` / the MSE arm loss
 need revisiting.
 """
 
@@ -72,7 +74,6 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--weight-decay", type=float, default=1e-4)
     p.add_argument("--warmup-steps", type=int, default=2_000)
     p.add_argument("--lambda-grip", type=float, default=0.05)
-    p.add_argument("--arm-beta", type=float, default=0.1)
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--val-interval", type=int, default=2_000)
     p.add_argument("--val-batches", type=int, default=50)
@@ -205,7 +206,6 @@ def run_validation(
     device: str,
     max_batches: int,
     lambda_grip: float,
-    arm_beta: float,
     pos_weight: torch.Tensor,
 ) -> dict:
     """Gate-1 dashboard on the held-out split (env-space metrics)."""
@@ -228,7 +228,6 @@ def run_validation(
             target,
             model,
             lambda_grip=lambda_grip,
-            arm_beta=arm_beta,
             gripper_pos_weight=pos_weight,
         )
         bsz = target.shape[0]
@@ -379,7 +378,6 @@ def main() -> None:
                 target,
                 model,
                 lambda_grip=args.lambda_grip,
-                arm_beta=args.arm_beta,
                 gripper_pos_weight=pos_weight,
             )
 
@@ -408,7 +406,6 @@ def main() -> None:
                 device,
                 args.val_batches,
                 args.lambda_grip,
-                args.arm_beta,
                 pos_weight,
             )
             print(f"  [val @ {step}] {json.dumps(val)}")

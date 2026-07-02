@@ -21,16 +21,17 @@ mapping anywhere:
 - **Temporal sampling**: :class:`DreamZeroLeRobotDataset` in ``multi_anchor``
   mode with ``max_chunk_size=1`` -- per sample, video frames at chunk offsets
   ``(0, 3, ..., 21)`` plus the boundary frame at 24 (9 frames total, matching
-  the 9 decoded dream frames) and the 16 contiguous chunk actions. The parent
-  dataset is frame-indexed, so every demo frame is a candidate anchor: the
-  ~16x anchor jitter falls out for free.
+  the 9 decoded dream frames) and the 24 contiguous chunk actions covering
+  the full 24-step visual span (the WAM chunk is 16; the consistency scorer
+  compares only the first 16). The parent dataset is frame-indexed, so every
+  demo frame is a candidate anchor: the anchor jitter falls out for free.
 - **Visuals**: groot's own ``VideoCrop(0.95)`` / ``VideoResize`` transforms
   (the SFT chain, eval mode = center crop, no jitter -- matching how the
   WAM's conditioning obs is processed at inference), then the libero_sim
   exterior|wrist width-concat, then the final squash to the
   ``target_video_height x target_video_width`` model canvas. Each half nets
   out to 160x160, exactly the decoded dream layout.
-- **Actions**: raw env-space ``[16, 7]`` chunks straight from the LeRobot
+- **Actions**: raw env-space ``[24, 7]`` chunks straight from the LeRobot
   columns (the SFT q99 normalization lives in ``StateActionTransform``,
   which is deliberately *not* applied -- the IDM standardizes with its own
   ``set_action_stats`` buffers).
@@ -114,7 +115,7 @@ def _build_sft_video_pipeline(
 
 
 class IDMChunkDataset(DreamZeroLeRobotDataset):
-    """(9-frame clip, 16-action chunk) samples for IDM training.
+    """(9-frame clip, 24-action chunk) samples for IDM training.
 
     Subclasses the SFT dataset for index resolution, multi-anchor temporal
     sampling, and raw modality loading; replaces the heavy SFT transform
@@ -133,7 +134,9 @@ class IDMChunkDataset(DreamZeroLeRobotDataset):
         split: ``"train"`` or ``"val"``; episode-level split (no window
             leakage), deterministic in ``split_seed``.
         action_horizon / video_in_chunk_offsets / macro_stride: leave at
-            defaults to mirror the LIBERO SFT config exactly.
+            defaults; the video window mirrors the LIBERO SFT config exactly,
+            while the default horizon of 24 (vs the SFT/WAM 16) labels the
+            full 24-step span the 9 frames depict.
         target_video_height / target_video_width: the WAM canvas size
             (LIBERO 5B: 160 x 320).
         train_aug: enable SFT-style random crop + color jitter (off by
@@ -148,7 +151,7 @@ class IDMChunkDataset(DreamZeroLeRobotDataset):
         split: str = "train",
         val_fraction: float = 0.05,
         split_seed: int = 0,
-        action_horizon: int = 16,
+        action_horizon: int = 24,
         video_in_chunk_offsets: Optional[tuple] = None,
         macro_stride: Optional[int] = None,
         target_video_height: int = 160,

@@ -174,9 +174,12 @@ class ConsistencyScorer:
     back to the action chunk that produced it -- predicts actions from the
     decoded RGB dream; the penalty is the distance to the WAM's predicted
     actions on the 7 env dims: arm SmoothL1 in the IDM's *standardized* units (so
-    translation does not drown rotation) plus gripper sign disagreement. Low
-    penalty = video and actions tell the same story (internally coherent); a
-    high penalty flags a candidate whose two heads disagree.
+    translation does not drown rotation) plus gripper sign disagreement. The
+    IDM may predict a longer horizon than the WAM chunk (it labels the full
+    24-step span of the 9-frame clip); only its first ``T`` steps (the WAM's
+    16) are compared. Low penalty = video and actions tell the same story
+    (internally coherent); a high penalty flags a candidate whose two heads
+    disagree.
 
     Needs no ground truth and no simulator -- computed purely from the model's
     own outputs, exploiting DreamZero's joint video+action structure. The IDM
@@ -224,9 +227,16 @@ class ConsistencyScorer:
             raise ValueError(
                 f"dream_input must start [K={k}, B={b}, ...], got {tuple(clips.shape)}"
             )
-        # One batched IDM forward over all K*B clips, then back to [K, B, T, D].
+        # One batched IDM forward over all K*B clips; the IDM horizon may
+        # exceed the WAM chunk (24 vs 16) -- compare only the first T steps.
         idm_in = clips.reshape(k * b, *clips.shape[2:]).to(self.device)
-        idm_act = self.idm.predict(idm_in).reshape(k, b, t, d).float().cpu()
+        idm_pred = self.idm.predict(idm_in).float().cpu()  # [K*B, H_idm, D]
+        if idm_pred.shape[1] < t or idm_pred.shape[2] != d:
+            raise ValueError(
+                f"IDM predicted {tuple(idm_pred.shape[1:])} per clip; "
+                f"needs at least horizon {t} with action dim {d}."
+            )
+        idm_act = idm_pred[:, :t, :].reshape(k, b, t, d)
 
         arm_std = self.idm.arm_std.detach().float().cpu().clamp_min(1e-6)
         diff = (a_wam[..., :-1] - idm_act[..., :-1]) / arm_std

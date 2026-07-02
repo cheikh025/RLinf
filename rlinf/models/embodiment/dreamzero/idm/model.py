@@ -43,9 +43,9 @@ Architecture (design record: ``dreamzero_prm_milestone3_idm_README.md``):
 - Heads: shared MLP -> arm deltas (standardized scale), shared linear ->
   per-step gripper logit.
 
-Loss (``compute_loss``): SmoothL1 (beta=0.1) on per-dim standardized arm
-targets + weighted BCE on the binarized gripper (the sim consumes only
-``sign(action)``), combined as ``L_arm + lambda_grip * L_grip``.
+Loss (``compute_loss``): MSE on per-dim standardized arm targets + weighted
+BCE on the binarized gripper (the sim consumes only ``sign(action)``),
+combined as ``L_arm + lambda_grip * L_grip``.
 """
 
 from dataclasses import dataclass
@@ -64,13 +64,15 @@ class IDMConfig:
     """Configuration for :class:`IDM`.
 
     Defaults mirror the DreamZero/LIBERO decoded clip: 9 frames (1 real +
-    8 dreamed) of a 160x320 canvas split into 2 views of 160x160, scoring a
-    16-step chunk of 7-dim actions (6 arm + 1 gripper).
+    8 dreamed) of a 160x320 canvas split into 2 views of 160x160. The clip
+    spans 24 raw steps (stride-3 offsets + boundary frame), so the IDM
+    predicts the full 24-step chunk of 7-dim actions (6 arm + 1 gripper);
+    the consistency scorer compares only the first 16 against the WAM chunk.
     """
 
     n_views: int = 2
     n_frames: int = 9
-    action_horizon: int = 16
+    action_horizon: int = 24
     action_dim: int = 7
     image_size: tuple = (160, 160)
 
@@ -327,24 +329,21 @@ def compute_loss(
     target_actions: torch.Tensor,
     model: IDM,
     lambda_grip: float = 0.05,
-    arm_beta: float = 0.1,
     gripper_pos_weight: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """IDM training loss.
 
-    Arm: SmoothL1 with small ``beta`` on standardized targets -- with typical
-    normalized-action magnitudes ~0.1, the default beta=1.0 would be pure-MSE
-    regime (maximal regression-to-the-mean); beta=0.1 keeps typical errors
-    quadratic while capping gradients on demo outliers. Gripper: weighted BCE
-    on the binarized command (``> 0``), since the sim consumes only its sign.
+    Arm: MSE on per-dim standardized targets. Gripper: weighted BCE on the
+    binarized command (``> 0``), since the sim consumes only its sign. The
+    jerk-ratio validation metric watches for MSE's regression-to-the-mean
+    over-smoothing.
 
     Args:
         outputs: dict from :meth:`IDM.forward`.
         target_actions: ``(B, action_horizon, action_dim)`` env-space actions.
         model: the IDM (for the standardization buffers).
-        lambda_grip: gripper loss weight; raw BCE is ~2 orders larger than
-            SmoothL1 on standardized residuals, so this must stay small.
-        arm_beta: SmoothL1 transition point in standardized units.
+        lambda_grip: gripper loss weight; raw BCE is much larger than MSE on
+            standardized residuals, so this must stay small.
         gripper_pos_weight: optional scalar tensor for BCE class imbalance.
 
     Returns:
@@ -353,7 +352,7 @@ def compute_loss(
     """
     target = torch.as_tensor(target_actions, dtype=torch.float32)
     arm_target = (target[..., :-1] - model.arm_mean) / model.arm_std
-    arm_loss = F.smooth_l1_loss(outputs["arm"], arm_target, beta=arm_beta)
+    arm_loss = F.mse_loss(outputs["arm"], arm_target)
 
     grip_target = (target[..., -1] > 0).float()
     grip_loss = F.binary_cross_entropy_with_logits(
