@@ -20,9 +20,10 @@ Wraps the official ``cosmos-policy`` inference stack behind RLinf's
 See ``dreamzero_docs/robocasa_cosmos_rlinf_integration_plan_README.md``.
 """
 
+import contextlib
 from typing import Any
 
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from rlinf.utils.logging import get_logger
 
@@ -35,10 +36,36 @@ _INSTALL_HINT = (
 )
 
 
+@contextlib.contextmanager
+def _tolerate_resolver_reregistration():
+    """Tolerate OmegaConf resolver name clashes during the cosmos-policy import.
+
+    cosmos-policy re-registers OmegaConf resolvers (e.g. ``subtract``) at import
+    time, and RLinf's :mod:`rlinf.utils.omega_resolver` has already registered a
+    ``subtract`` resolver. ``register_new_resolver`` raises on a duplicate name
+    unless ``replace=True``, so force ``replace`` for the duration of the cosmos
+    import only. The semantics are compatible (cosmos's variadic ``subtract`` is a
+    superset of RLinf's binary one), and RLinf's resolvers stay intact if the
+    cosmos import fails partway through.
+    """
+    orig = OmegaConf.register_new_resolver
+
+    def _patched(name, resolver, *args, **kwargs):
+        kwargs.setdefault("replace", True)
+        return orig(name, resolver, *args, **kwargs)
+
+    OmegaConf.register_new_resolver = _patched
+    try:
+        yield
+    finally:
+        OmegaConf.register_new_resolver = orig
+
+
 def _import_cosmos_utils() -> Any:
     """Lazily import NVIDIA's cosmos_utils (heavy deps; import at build time)."""
     try:
-        from cosmos_policy.experiments.robot import cosmos_utils  # type: ignore
+        with _tolerate_resolver_reregistration():
+            from cosmos_policy.experiments.robot import cosmos_utils  # type: ignore
     except ImportError as exc:  # pragma: no cover - env-dependent
         raise ImportError(_INSTALL_HINT) from exc
     return cosmos_utils
@@ -47,9 +74,10 @@ def _import_cosmos_utils() -> Any:
 def _import_policy_eval_config() -> Any:
     """Lazily import NVIDIA's RoboCasa ``PolicyEvalConfig``."""
     try:
-        from cosmos_policy.experiments.robot.robocasa.run_robocasa_eval import (  # type: ignore
-            PolicyEvalConfig,
-        )
+        with _tolerate_resolver_reregistration():
+            from cosmos_policy.experiments.robot.robocasa.run_robocasa_eval import (  # type: ignore
+                PolicyEvalConfig,
+            )
     except ImportError as exc:  # pragma: no cover - env-dependent
         raise ImportError(_INSTALL_HINT) from exc
     return PolicyEvalConfig
