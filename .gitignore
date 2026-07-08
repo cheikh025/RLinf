@@ -25,3 +25,4 @@ PKG-INFO
 # Local DreamZero notes/docs and scratch checking scripts (kept out of GitHub)
 dreamzero_docs/
 dreamzero_checks/
+*.zip
