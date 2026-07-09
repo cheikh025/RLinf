@@ -35,11 +35,31 @@ _INSTALL_HINT = (
 
 
 def _import_cosmos_utils() -> Any:
-    """Lazily import NVIDIA's cosmos_utils (heavy deps; only at model build)."""
+    """Lazily import NVIDIA's cosmos_utils (heavy deps; only at model build).
+
+    Cosmos and RLinf both register OmegaConf resolvers named "add"/"subtract"/
+    "multiply" at import time via ``register_new_resolver`` (without ``replace``).
+    Whichever imports second otherwise raises
+    ``ValueError: resolver 'subtract' is already registered``. RLinf is imported
+    first in the worker process, so we make Cosmos's registrations idempotent
+    (``replace=True``) for the duration of the import. The overlapping resolvers
+    are numerically identical for the (binary) args RLinf configs use.
+    """
+    from omegaconf import OmegaConf
+
+    _orig_register = OmegaConf.register_new_resolver
+
+    def _register_with_replace(name, resolver, *args, **kwargs):
+        kwargs.setdefault("replace", True)
+        return _orig_register(name, resolver, *args, **kwargs)
+
     try:
+        OmegaConf.register_new_resolver = _register_with_replace
         from cosmos_policy.experiments.robot import cosmos_utils  # type: ignore
     except ImportError as exc:  # pragma: no cover - env-dependent
         raise ImportError(_INSTALL_HINT) from exc
+    finally:
+        OmegaConf.register_new_resolver = _orig_register
     return cosmos_utils
 
 
