@@ -1,0 +1,53 @@
+# cosmos_policy_robocasa_2b.yaml
+# NVIDIA Cosmos Policy RoboCasa (Predict2-2B), eval-only wrapper for RLinf.
+# Defaults mirror NVIDIA's official RoboCasa inference config
+# (cosmos_predict2_2b_480p_robocasa_50_demos_per_task__inference). The only
+# behavioral difference vs a raw robosuite eval is that images are NOT flipped
+# here: RLinf's RobocasaEnv already returns upright frames.
+
+model_type: "cosmos_policy"
+precision: bf16
+model_path: nvidia/Cosmos-Policy-RoboCasa-Predict2-2B   # HF repo id or local ckpt dir
+
+is_lora: False
+# Cosmos get_model() places the model on device itself; skip RLinf's generic .to().
+load_to_device: False
+
+# RLinf execution contract
+action_dim: 7
+num_action_chunks: 16   # executed open-loop steps (first 16 of the 32 generated)
+# RoboCasa action layout selector: env_worker passes this as `action_space` to
+# prepare_actions_for_robocasa (7D [rel_pose_6d + gripper] -> padded to 12D).
+# REQUIRED: if unset, prepare_actions gets action_space=None and crashes.
+policy_setup: 7d
+
+# Cosmos experiment selection
+cosmos_config: cosmos_predict2_2b_480p_robocasa_50_demos_per_task__inference
+cosmos_config_file: cosmos_policy/config/config.py
+
+# Normalization + text-embedding assets (ship in the HF checkpoint repo; local
+# paths also work). t5 path lets get_action use the cache instead of loading the
+# T5-XXL encoder live.
+dataset_stats_path: nvidia/Cosmos-Policy-RoboCasa-Predict2-2B/robocasa_dataset_statistics.json
+t5_text_embeddings_path: nvidia/Cosmos-Policy-RoboCasa-Predict2-2B/robocasa_t5_embeddings.pkl
+
+# Cosmos diffusion / IO knobs (match training/eval)
+suite: robocasa
+chunk_size: 32
+num_denoising_steps_action: 5
+use_wrist_image: True
+num_wrist_images: 1
+use_third_person_image: True
+num_third_person_images: 2
+use_proprio: True
+normalize_proprio: True
+unnormalize_actions: True
+trained_with_image_aug: True
+use_jpeg_compression: True
+use_variance_scale: False
+flip_images: False           # documented no-op: env already returns upright frames
+seed: 195
+
+# Skip Cosmos's parallel future-image + value VAE decode (eval only needs the
+# action). Set True to surface Cosmos's value estimate in the rollout result.
+compute_value: False

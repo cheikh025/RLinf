@@ -1,0 +1,11 @@
+# Extra pins for the Cosmos Policy (RoboCasa) RLinf integration (eval-only).
+#
+# The heavy stack (torch, transformers, robosuite/robocasa, mujoco, cosmos-predict2,
+# transformer-engine, flash-attn, natten) is installed in install_cosmos_policy_model():
+#   - RLinf's RoboCasa fork via install_robocasa_env()
+#   - the official cosmos-policy source via `uv pip install --no-config -e <cosmos-policy>`
+#   - the cu128 GPU binaries via the `--no-config` cosmos dependency index.
+#
+# Keep this file minimal to avoid re-solving cosmos-policy's own pinned stack. Add
+# only RLinf-side runtime helpers that cosmos-policy does not already provide.
+imageio-ffmpeg
