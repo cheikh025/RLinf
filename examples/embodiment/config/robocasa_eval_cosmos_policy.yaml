@@ -21,7 +21,10 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    env,rollout: all
+    # `actor` must be declared even for only_eval: validate_cfg computes
+    # actor_world_size from the placement. eval_embodied_agent.py only launches
+    # the rollout + env worker groups, so no actor worker is actually created.
+    actor,env,rollout: all
 
 runner:
   task_type: embodied
