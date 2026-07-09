@@ -74,7 +74,7 @@ GITHUB_PREFIX=""
 NO_ROOT=0
 NO_INSTALL_RLINF_CMD="--no-install-project"
 SUPPORTED_TARGETS=("embodied" "agentic" "docs")
-SUPPORTED_MODELS=("openvla" "openvla-oft" "openpi" "gr00t" "gr00t_n1d6" "dexbotic" "starvla" "lingbotvla" "dreamzero" "cosmos_policy" "qwen3_vl" "abot_m0")
+SUPPORTED_MODELS=("openvla" "openvla-oft" "openpi" "gr00t" "gr00t_n1d6" "dexbotic" "starvla" "lingbotvla" "dreamzero" "qwen3_vl" "abot_m0")
 SUPPORTED_ENVS=("behavior" "maniskill_libero" "libero" "metaworld" "calvin" "isaaclab" "robocasa" "franka" "franka-dexhand" "frankasim" "robotwin" "habitat" "opensora" "wan" "genesis" "xsquare_turtle2" "liberopro" "liberoplus" "roboverse" "embodichain" "d4rl" "dosw1" "gim_arm" "dummy" "polaris")
 
 
@@ -1379,40 +1379,6 @@ install_dreamzero_model() {
     esac
 }
 
-install_cosmos_policy_model() {
-    # NVIDIA Cosmos Policy (RoboCasa) native integration, eval-only.
-    #
-    # Plan A (this function): single RLinf venv that has BOTH the RLinf RoboCasa
-    # env glue and the official cosmos-policy inference stack, so the RLinf runner
-    # can `import cosmos_policy` from the model wrapper.
-    #
-    # GATING RISK (R1): cosmos-policy pins its own torch/robosuite/robocasa fork
-    # (torch 2.7 cu128, robosuite 1.5.1, moojink/robocasa-cosmos-policy) which may
-    # conflict with RLinf's RoboCasa stack. If `import cosmos_policy` OR
-    # RobocasaEnv.reset/step fails in this venv, fall back to the separate
-    # cosmos venv / Docker path in
-    # dreamzero_docs/robocasa_cosmos_policy_feasibility_README.md (Plan B: server).
-    case "$ENV_NAME" in
-        robocasa|"")
-            create_and_sync_venv
-            install_common_embodied_deps
-            install_robocasa_env
-            # Official Cosmos Policy code (provides cosmos_policy.experiments.robot.*).
-            local cosmos_dir
-            cosmos_dir=$(clone_or_reuse_repo COSMOS_POLICY_PATH "$VENV_DIR/cosmos-policy" https://github.com/NVlabs/cosmos-policy.git)
-            # TODO(verify): --no-build-isolation and/or version pins may be needed so
-            # cosmos-policy's pyproject does not re-solve torch away from RLinf's.
-            uv pip install -e "$cosmos_dir"
-            uv pip install -r $SCRIPT_DIR/embodied/models/cosmos_policy.txt
-            install_flash_attn
-            ;;
-        *)
-            echo "Environment '$ENV_NAME' is not supported for Cosmos Policy model (use --env robocasa)." >&2
-            exit 1
-            ;;
-    esac
-}
-
 install_qwen3_vl_model() {
     create_and_sync_venv
     install_common_embodied_deps
@@ -2014,9 +1980,6 @@ main() {
                     ;;
                 dreamzero)
                     install_dreamzero_model
-                    ;;
-                cosmos_policy)
-                    install_cosmos_policy_model
                     ;;
                 qwen3_vl)
                     install_qwen3_vl_model

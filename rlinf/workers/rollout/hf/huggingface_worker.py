@@ -262,7 +262,6 @@ class MultiStepRolloutWorker(Worker):
             SupportedModel.GR00T_N1D6,
             SupportedModel.ABOT_M0,
             SupportedModel.DREAMZERO,
-            SupportedModel.COSMOS_POLICY,
             SupportedModel.CNN_POLICY,
             SupportedModel.CFG_MODEL,
         ]:
