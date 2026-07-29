@@ -74,7 +74,7 @@ GITHUB_PREFIX=""
 NO_ROOT=0
 NO_INSTALL_RLINF_CMD="--no-install-project"
 SUPPORTED_TARGETS=("embodied" "agentic" "docs")
-SUPPORTED_MODELS=("openvla" "openvla-oft" "openpi" "gr00t" "gr00t_n1d6" "dexbotic" "starvla" "lingbotvla" "dreamzero" "cosmos_policy" "qwen3_vl" "abot_m0")
+SUPPORTED_MODELS=("openvla" "openvla-oft" "openpi" "gr00t" "gr00t_n1d6" "dexbotic" "starvla" "lingbotvla" "dreamzero" "qwen3_vl" "abot_m0")
 SUPPORTED_ENVS=("behavior" "maniskill_libero" "libero" "metaworld" "calvin" "isaaclab" "robocasa" "franka" "franka-dexhand" "frankasim" "robotwin" "habitat" "opensora" "wan" "genesis" "xsquare_turtle2" "liberopro" "liberoplus" "roboverse" "embodichain" "d4rl" "dosw1" "gim_arm" "dummy" "polaris")
 
 
@@ -1379,56 +1379,6 @@ install_dreamzero_model() {
     esac
 }
 
-install_cosmos_policy_model() {
-    # NVIDIA Cosmos Policy (RoboCasa) native integration, eval-only.
-    #
-    # Single RLinf venv that has BOTH the RLinf RoboCasa env glue and the official
-    # cosmos-policy inference stack, so the RLinf model wrapper can
-    # `import cosmos_policy`. The Cosmos GPU stack is cu128 (torch 2.7), which
-    # conflicts with RLinf's pyproject `[tool.uv]` torch override, so every Cosmos
-    # install step uses `--no-config` to make uv ignore that override.
-    #
-    # Recommended invocation:
-    #   bash requirements/install.sh embodied --model cosmos_policy --env robocasa --torch 2.7.0
-    case "$ENV_NAME" in
-        robocasa|"")
-            create_and_sync_venv
-            install_common_embodied_deps
-            install_robocasa_env
-
-            # Official Cosmos Policy source (cosmos_policy.experiments.robot.*).
-            # Tested against commit 18a2acc; set COSMOS_POLICY_PATH to reuse your
-            # own known-good checkout instead of cloning.
-            local cosmos_dir
-            cosmos_dir=$(clone_or_reuse_repo COSMOS_POLICY_PATH "$VENV_DIR/cosmos-policy" https://github.com/NVlabs/cosmos-policy.git)
-            if [ -z "${COSMOS_POLICY_PATH:-}" ]; then
-                git -C "$cosmos_dir" checkout 18a2acc \
-                    || echo "warning: could not pin cosmos-policy to 18a2acc" >&2
-            fi
-            # Install Cosmos WITH its dependency graph, but pass --no-config so uv
-            # ignores RLinf's pyproject `[tool.uv]` torch==2.6.0 override (which
-            # otherwise fails resolution). The cu128 torch stack is forced below.
-            uv pip install --no-config -e "$cosmos_dir"
-            uv pip install --no-config -r "$SCRIPT_DIR/embodied/models/cosmos_policy.txt"
-
-            # Cosmos cu128 GPU stack (Blackwell/sm_120-capable). Confirmed working:
-            # torch 2.7.0+cu128, transformer-engine 2.2, flash-attn 2.7.3, natten 0.21.
-            local COSMOS_CU128_INDEX="https://nvidia-cosmos.github.io/cosmos-dependencies/v1.2.0/cu128_torch27/simple"
-            uv pip install --no-config \
-                --reinstall-package torch --reinstall-package torchvision --reinstall-package torchaudio \
-                --index-url https://download.pytorch.org/whl/cu128 \
-                torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0
-            uv pip install --no-config --no-build-isolation --no-deps \
-                --index-strategy unsafe-best-match --extra-index-url "$COSMOS_CU128_INDEX" \
-                transformer-engine==2.2.0 "flash-attn==2.7.3+cu128.torch27" natten==0.21.0
-            ;;
-        *)
-            echo "Environment '$ENV_NAME' is not supported for Cosmos Policy model (use --env robocasa)." >&2
-            exit 1
-            ;;
-    esac
-}
-
 install_qwen3_vl_model() {
     create_and_sync_venv
     install_common_embodied_deps
@@ -2030,9 +1980,6 @@ main() {
                     ;;
                 dreamzero)
                     install_dreamzero_model
-                    ;;
-                cosmos_policy)
-                    install_cosmos_policy_model
                     ;;
                 qwen3_vl)
                     install_qwen3_vl_model
