@@ -362,9 +362,10 @@ class DreamZeroPolicy(VLA, BasePolicy):
         one uniformly at random per env (control baseline, see
         ``_select_random``); "prm" delegates to the weighted PRM terms in
         ``bok_prm_terms`` (see ``rlinf.models.embodiment.dreamzero.prm`` and
-        ``_select_candidate``). Candidate-0 baseline runs should use
-        ``best_of_k=1`` and skip this path. All candidates are saved/logged for
-        diversity verification.
+        ``_select_candidate``); "consensus" is the external latent-space
+        baseline of arXiv 2605.07514 (see ``_select_consensus``). Candidate-0
+        baseline runs should use ``best_of_k=1`` and skip this path. All
+        candidates are saved/logged for diversity verification.
 
         Enabled with ``actor.model.best_of_k`` > 1. Optional:
         ``bok_base_seed`` (default: the head's own seed), ``bok_output_dir``
@@ -383,10 +384,12 @@ class DreamZeroPolicy(VLA, BasePolicy):
 
         need_cons = self._cons_dreams_needed()
         need_prog = self._prog_dreams_needed()
+        need_latents = self._latents_needed()
         candidates = []
         seeds = []
         cons_inputs = []  # per-candidate decoded RGB canvases for the IDM
         prog_dreams = []  # per-candidate decoded RGB canvases for the progress term
+        latents = []  # per-candidate pre-decode VAE latents (consensus baseline)
         try:
             for k in range(num_candidates):
                 seed = base_seed + k
@@ -406,6 +409,11 @@ class DreamZeroPolicy(VLA, BasePolicy):
                     cons_inputs.append(decoded)
                 if need_prog and decoded is not None:
                     prog_dreams.append(decoded)
+                # Consensus baseline scores the latent directly, so it must not
+                # join the decode condition above -- that is the whole point of
+                # the method being cheaper than any decode-based term.
+                if need_latents and video_pred is not None:
+                    latents.append(video_pred)
                 self._maybe_save_video_pred(
                     video_pred,
                     mode=mode,
@@ -433,6 +441,7 @@ class DreamZeroPolicy(VLA, BasePolicy):
             cons_inputs if need_cons else None,
             prog_dreams if need_prog else None,
             obs,
+            latents if need_latents else None,
         )
         selected_pred = self._gather_selected_candidate(candidates, chosen_index)
 
@@ -550,8 +559,8 @@ class DreamZeroPolicy(VLA, BasePolicy):
         if raw_selector is None or str(raw_selector).strip() == "":
             raise ValueError(
                 "actor.model.best_of_k > 1 requires actor.model.bok_selector "
-                "to be 'random' or 'prm'. Use actor.model.best_of_k=1 for the "
-                "candidate-0 baseline."
+                "to be 'random', 'prm', or 'consensus'. Use "
+                "actor.model.best_of_k=1 for the candidate-0 baseline."
             )
 
         selector = str(raw_selector).lower()
@@ -568,11 +577,21 @@ class DreamZeroPolicy(VLA, BasePolicy):
                 "bok_selector='first' is no longer supported for best_of_k > 1. "
                 "Use actor.model.best_of_k=1 for the candidate-0 baseline."
             )
-        if selector not in ("random", "prm"):
+        if selector not in ("random", "prm", "consensus"):
             raise ValueError(
-                f"Unknown bok_selector {selector!r}; use 'random' or 'prm'."
+                f"Unknown bok_selector {selector!r}; use 'random', 'prm', "
+                "or 'consensus'."
             )
         return selector
+
+    def _latents_needed(self) -> bool:
+        """True when the selector scores pre-decode VAE latents.
+
+        Only ``bok_selector=consensus`` does. Kept separate from
+        ``_cons_dreams_needed`` / ``_prog_dreams_needed`` so the consensus
+        baseline never triggers a dream decode it does not use.
+        """
+        return self._bok_selector() == "consensus"
 
     def _select_candidate(
         self,
@@ -580,6 +599,7 @@ class DreamZeroPolicy(VLA, BasePolicy):
         cons_inputs: Optional[list] = None,
         prog_dreams: Optional[list] = None,
         obs: Optional[dict] = None,
+        latents: Optional[list] = None,
     ) -> tuple[Any, Optional[dict]]:
         """Pick which best-of-K candidate to execute.
 
@@ -604,9 +624,12 @@ class DreamZeroPolicy(VLA, BasePolicy):
         selector = self._bok_selector()
         if selector == "random":
             return self._select_random(env_actions)
+        if selector == "consensus":
+            return self._select_consensus(latents)
         if selector != "prm":
             raise ValueError(
-                f"Unknown bok_selector {selector!r}; use 'random' or 'prm'."
+                f"Unknown bok_selector {selector!r}; use 'random', 'prm', "
+                "or 'consensus'."
             )
         self._ensure_prm()
         env_stack = torch.as_tensor(np.stack(env_actions), dtype=torch.float32)
@@ -624,11 +647,7 @@ class DreamZeroPolicy(VLA, BasePolicy):
         # Progress term input: per-candidate dreams split into exterior/wrist
         # views -> [K, B, V, F, 3, H, W], plus the task language. Only when a
         # progress model is loaded.
-        if (
-            self._bok_prm.prog_scorer is not None
-            and prog_dreams
-            and obs is not None
-        ):
+        if self._bok_prm.prog_scorer is not None and prog_dreams and obs is not None:
             from rlinf.models.embodiment.dreamzero.idm.model import split_canvas
 
             dream_rgb = torch.stack([split_canvas(d) for d in prog_dreams], dim=0)
@@ -638,6 +657,7 @@ class DreamZeroPolicy(VLA, BasePolicy):
         chosen_per_env = info.get("chosen_index_per_env")
         num_envs = len(chosen_per_env) if isinstance(chosen_per_env, list) else 1
         if num_envs > 1:
+
             def _shape(key):
                 return list(np.asarray(info[key]).shape) if key in info else None
 
@@ -717,9 +737,9 @@ class DreamZeroPolicy(VLA, BasePolicy):
         seed = int(getattr(self.config, "bok_random_seed", 0) or 0)
         if self._bok_random_rng is None:
             self._bok_random_rng = np.random.default_rng(seed)
-        chosen = self._bok_random_rng.integers(
-            0, num_candidates, size=num_envs
-        ).astype(np.int64)
+        chosen = self._bok_random_rng.integers(0, num_candidates, size=num_envs).astype(
+            np.int64
+        )
         chosen_counts = np.bincount(chosen, minlength=num_candidates).tolist()
         info = {
             "selector": "random",
@@ -736,6 +756,103 @@ class DreamZeroPolicy(VLA, BasePolicy):
             num_candidates,
             chosen_counts,
             seed,
+        )
+        # Scalar for the single-env case; per-env list otherwise.
+        chosen_index = int(chosen[0]) if num_envs == 1 else chosen.tolist()
+        return chosen_index, info
+
+    def _select_consensus(self, latents: Optional[list]) -> tuple[Any, dict]:
+        """Competitor baseline: latent-space Consistency-Consensus selection.
+
+        ``bok_selector=consensus``. Reimplements the value-free test-time
+        selection of *Is the Future Compatible? Diagnosing Dynamic Consistency
+        in World Action Models* (arXiv 2605.07514) so it can be compared
+        head-to-head against our PRM terms on the same generator and suite.
+
+        Their formulation, applied per env over the K candidate futures::
+
+            o_bar = (1 / K) * sum_j  z_j                 consensus reference
+            d_i   = MSE(z_i, o_bar)                      distance in VAE latent space
+            c_i   = exp(-alpha * d_i)                    alpha = 0.1 (their default)
+            pick  = argmax_i c_i                         winner-takes-all
+
+        This is a *baseline*, not one of our PRM terms: it is a different
+        consistency axis (agreement **across** candidates in observation latent
+        space) from our ``consistency`` term (agreement **within** a candidate
+        between its dreamed video and its own action chunk). It is deliberately
+        not combinable with ``bok_prm_terms`` -- mixing them would defeat the
+        comparison it exists to provide.
+
+        Scores the pre-decode latent, so no VAE decode, no IDM and no progress
+        model are loaded: this is the cheapest selector in the file.
+
+        Note: for a single-term argmax the monotone map is irrelevant --
+        ``argmax exp(-alpha * d) == argmin d`` for any ``alpha > 0`` -- so the
+        selection is exactly faithful to the paper regardless of
+        ``bok_consensus_alpha``. The alpha is kept so the logged scores match
+        their scale.
+
+        Also logs ``latent_delta_per_env``: the mean absolute change along each
+        candidate's own latent time axis, i.e. how much that dreamed future
+        actually moves. This is their **background collapse** diagnostic, not a
+        distance to the consensus reference. They report a negative correlation
+        (r ~= -0.47) between latent change and consistency score -- near-static
+        futures score deceptively well because a still scene is trivially easy
+        to agree with. Logging it per candidate lets that be checked directly,
+        here and against our own consistency term.
+        """
+        if not latents:
+            raise ValueError(
+                "bok_selector='consensus' requires per-candidate video_pred "
+                "latents, but none were collected. The model returned no "
+                "video_pred for this chunk."
+            )
+        # [K, B, C, T, H, W]; float32 for a stable mean/MSE (latents are bf16).
+        z = torch.stack([torch.as_tensor(v) for v in latents], dim=0).float()
+        num_candidates, num_envs = int(z.shape[0]), int(z.shape[1])
+
+        reference = z.mean(dim=0, keepdim=True)  # o_bar, broadcast over K
+        distance = ((z - reference) ** 2).flatten(2).mean(-1)  # [K, B]
+        alpha = float(getattr(self.config, "bok_consensus_alpha", 0.1))
+        score = torch.exp(-alpha * distance)  # [K, B]
+
+        # Background-collapse diagnostic: mean |z_t+1 - z_t| along the latent
+        # time axis, per candidate per env. Low value == near-static future.
+        if z.shape[3] > 1:
+            latent_delta = z.diff(dim=3).abs().flatten(2).mean(-1)  # [K, B]
+        else:
+            latent_delta = torch.zeros_like(distance)
+
+        chosen = score.argmax(dim=0).cpu().numpy().astype(np.int64)  # [B]
+        chosen_counts = np.bincount(chosen, minlength=num_candidates).tolist()
+
+        info = {
+            "selector": "consensus",
+            "chosen_index_per_env": chosen.tolist(),
+            "chosen_counts": chosen_counts,
+            "consensus_alpha": alpha,
+            "consensus_distance_per_env": distance.cpu().tolist(),
+            "consensus_score_per_env": score.cpu().tolist(),
+            "latent_delta_per_env": latent_delta.cpu().tolist(),
+        }
+        if num_envs == 1:
+            info["consensus_distance"] = distance[:, 0].cpu().tolist()
+            info["consensus_score"] = score[:, 0].cpu().tolist()
+            info["latent_delta"] = latent_delta[:, 0].cpu().tolist()
+
+        logger.info(
+            "[dreamzero best-of-k] call %d: selector=consensus chose %s "
+            "(num_envs=%d, K=%d, chosen_counts=%s, alpha=%.4g, "
+            "latent_shape=%s, mean_distance=%.6g, mean_latent_delta=%.6g)",
+            self._bok_call_count,
+            chosen.tolist(),
+            num_envs,
+            num_candidates,
+            chosen_counts,
+            alpha,
+            tuple(z.shape),
+            float(distance.mean()),
+            float(latent_delta.mean()),
         )
         # Scalar for the single-env case; per-env list otherwise.
         chosen_index = int(chosen[0]) if num_envs == 1 else chosen.tolist()
@@ -819,9 +936,7 @@ class DreamZeroPolicy(VLA, BasePolicy):
                 "identical": raw_identical,
             }
         else:
-            env_flat = env_stack.transpose(0, 1).contiguous().reshape(
-                num_envs, k, -1
-            )
+            env_flat = env_stack.transpose(0, 1).contiguous().reshape(num_envs, k, -1)
             env_dist = torch.cdist(env_flat, env_flat)  # [B, K, K]
             env_pairwise = env_dist[:, iu[0], iu[1]]
             zero_pair_envs = (env_pairwise.min(dim=1).values == 0.0).tolist()
