@@ -35,6 +35,24 @@ from rlinf.utils.logging import get_logger
 logger = get_logger()
 
 
+class _PrmTermOverride:
+    """Read-only config view that swaps ``bok_prm_terms`` for another list.
+
+    Lets a second :class:`DreamZeroPRM` be built from the same policy config
+    with a different term set, so ``bok_prm_log_terms`` can be scored without
+    touching the selecting PRM or ``prm.py``.
+    """
+
+    def __init__(self, config: Any, terms: Any):
+        self._config = config
+        self._terms = terms
+
+    def __getattr__(self, name: str) -> Any:
+        if name == "bok_prm_terms":
+            return self._terms
+        return getattr(self._config, name)
+
+
 class DreamZeroPolicy(VLA, BasePolicy):
     """Lightweight DreamZero action model: IdentityBackbone + WANPolicyHead."""
 
@@ -74,10 +92,14 @@ class DreamZeroPolicy(VLA, BasePolicy):
         # (cross-chunk continuity term); see _select_candidate.
         self._bok_prm = None
         self._bok_prev_action = None
+        # Lazily-built score-only PRM (bok_prm_log_terms): its terms are scored
+        # and logged every call but never decide anything; see _ensure_log_prm.
+        self._bok_log_prm = None
         # Lazily-seeded RNG for the random-selection control baseline
         # (bok_selector=random); see _select_random.
         self._bok_random_rng = None
         self._bok_exec_alias_warned = False
+        self._bok_log_terms_announced = False
 
     # This method is called in FSDPModelManager.setup_model_and_optimizer
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs={}):
@@ -470,7 +492,8 @@ class DreamZeroPolicy(VLA, BasePolicy):
         is separately capped).
         """
         if self._bok_selector() != "prm":
-            return False
+            log_prm = self._ensure_log_prm()
+            return bool(log_prm is not None and log_prm.uses_consistency)
         return bool(self._ensure_prm().uses_consistency)
 
     def _prog_dreams_needed(self) -> bool:
@@ -480,7 +503,8 @@ class DreamZeroPolicy(VLA, BasePolicy):
         independent of the IDM's pixel/latent kind.
         """
         if self._bok_selector() != "prm":
-            return False
+            log_prm = self._ensure_log_prm()
+            return bool(log_prm is not None and log_prm.uses_progress)
         return bool(self._ensure_prm().uses_progress)
 
     def _progress_language(self, obs: dict) -> list:
@@ -553,6 +577,71 @@ class DreamZeroPolicy(VLA, BasePolicy):
             self._bok_prm = DreamZeroPRM(self.config)
         return self._bok_prm
 
+    def _build_prm_context(self, prm, cons_inputs, prog_dreams, obs) -> dict:
+        """Assemble the per-term inputs a :class:`DreamZeroPRM` needs.
+
+        Shared by the selecting PRM and the score-only PRM so both see exactly
+        the same candidates, dreams and continuity action.
+        """
+        context = {}
+        if self._bok_prev_action is not None:
+            context["prev_action"] = self._bok_prev_action
+        # Consistency term input: split each decoded canvas into the per-view
+        # layout -> [K, B, V, F, 3, H, W/2].
+        if prm.cons_scorer is not None and cons_inputs:
+            from rlinf.models.embodiment.dreamzero.idm.model import split_canvas
+
+            context["dream_input"] = torch.stack(
+                [split_canvas(d) for d in cons_inputs], dim=0
+            )
+        # Progress term input: per-candidate dreams split into exterior/wrist
+        # views -> [K, B, V, F, 3, H, W], plus the task language. Only when a
+        # progress model is loaded.
+        if prm.prog_scorer is not None and prog_dreams and obs is not None:
+            from rlinf.models.embodiment.dreamzero.idm.model import split_canvas
+
+            dream_rgb = torch.stack([split_canvas(d) for d in prog_dreams], dim=0)
+            language = self._progress_language(obs)
+            context["progress"] = {"dream_rgb": dream_rgb, "language": language}
+        return context
+
+    def _ensure_log_prm(self):
+        """Lazily build the score-only PRM described by ``bok_prm_log_terms``.
+
+        Returns ``None`` when the key is unset, or when the selector is already
+        ``prm`` (in which case ``bok_prm_terms`` is doing the scoring and a
+        second pass would only duplicate work).
+
+        The purpose is the randomised-logging run: with
+        ``bok_selector=random``, the executed candidate is a uniform draw that
+        never sees a score, while every term is still computed and written to
+        ``best_of_k_info.jsonl``. Because the choice is provably independent of
+        the scores, the resulting log is a randomised trial -- any scoring rule
+        (any lambda, any term weight, any normalisation) can be ranked offline
+        against the outcome without the selection confound that makes a
+        ``prm``-selected run unusable for that purpose.
+        """
+        raw_terms = getattr(self.config, "bok_prm_log_terms", None)
+        if raw_terms is None or (
+            isinstance(raw_terms, str) and raw_terms.strip() == ""
+        ):
+            return None
+        if self._bok_selector() == "prm":
+            return None
+        if self._bok_log_prm is None:
+            from rlinf.models.embodiment.dreamzero.prm import DreamZeroPRM
+
+            self._bok_log_prm = DreamZeroPRM(_PrmTermOverride(self.config, raw_terms))
+        if not self._bok_log_terms_announced:
+            logger.info(
+                "[dreamzero best-of-k] bok_prm_log_terms=%s scored for LOGGING "
+                "ONLY; selection stays '%s'.",
+                list(self._bok_log_prm.active_terms),
+                self._bok_selector(),
+            )
+            self._bok_log_terms_announced = True
+        return self._bok_log_prm
+
     def _bok_selector(self) -> str:
         """Return the explicit best-of-K selector for ``best_of_k > 1``."""
         raw_selector = getattr(self.config, "bok_selector", None)
@@ -622,10 +711,28 @@ class DreamZeroPolicy(VLA, BasePolicy):
         Robometer last-frame progress reward term.
         """
         selector = self._bok_selector()
-        if selector == "random":
-            return self._select_random(env_actions)
-        if selector == "consensus":
-            return self._select_consensus(latents)
+        if selector in ("random", "consensus"):
+            if selector == "random":
+                chosen, info = self._select_random(env_actions)
+            else:
+                chosen, info = self._select_consensus(latents)
+            # Score-only terms: computed here, attached to the log, and thrown
+            # away. The executed candidate above never saw them, which is what
+            # makes the resulting jsonl a randomised trial.
+            log_prm = self._ensure_log_prm()
+            if log_prm is not None:
+                env_stack = torch.as_tensor(np.stack(env_actions), dtype=torch.float32)
+                _, log_info = log_prm.select(
+                    env_stack,
+                    context=self._build_prm_context(
+                        log_prm, cons_inputs, prog_dreams, obs
+                    ),
+                )
+                log_info.pop("chosen_index_per_env", None)
+                log_info.pop("chosen_counts", None)
+                log_info.pop("chosen_index", None)
+                info["log_terms"] = log_info
+            return chosen, info
         if selector != "prm":
             raise ValueError(
                 f"Unknown bok_selector {selector!r}; use 'random', 'prm', "
@@ -633,26 +740,7 @@ class DreamZeroPolicy(VLA, BasePolicy):
             )
         self._ensure_prm()
         env_stack = torch.as_tensor(np.stack(env_actions), dtype=torch.float32)
-        context = {}
-        if self._bok_prev_action is not None:
-            context["prev_action"] = self._bok_prev_action
-        # Consistency term input: split each decoded canvas into the per-view
-        # layout -> [K, B, V, F, 3, H, W/2].
-        if self._bok_prm.cons_scorer is not None and cons_inputs:
-            from rlinf.models.embodiment.dreamzero.idm.model import split_canvas
-
-            context["dream_input"] = torch.stack(
-                [split_canvas(d) for d in cons_inputs], dim=0
-            )
-        # Progress term input: per-candidate dreams split into exterior/wrist
-        # views -> [K, B, V, F, 3, H, W], plus the task language. Only when a
-        # progress model is loaded.
-        if self._bok_prm.prog_scorer is not None and prog_dreams and obs is not None:
-            from rlinf.models.embodiment.dreamzero.idm.model import split_canvas
-
-            dream_rgb = torch.stack([split_canvas(d) for d in prog_dreams], dim=0)
-            language = self._progress_language(obs)
-            context["progress"] = {"dream_rgb": dream_rgb, "language": language}
+        context = self._build_prm_context(self._bok_prm, cons_inputs, prog_dreams, obs)
         chosen, info = self._bok_prm.select(env_stack, context=context)
         chosen_per_env = info.get("chosen_index_per_env")
         num_envs = len(chosen_per_env) if isinstance(chosen_per_env, list) else 1
