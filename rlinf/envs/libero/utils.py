@@ -261,5 +261,8 @@ def record_completed_episode_task_stats(
             task_success_stats[tid] = {"success": 0, "total": 0}
         task_success_stats[tid]["total"] += 1
         task_success_stats[tid]["success"] += int(ok)
-        logger.info(f"[libero eval] task_id={tid}, trial_id={trial_id}, success={ok}")
+        logger.info(
+            f"[libero eval] env_id={int(eid)}, task_id={tid}, "
+            f"trial_id={trial_id}, success={ok}"
+        )
     return count_mask
