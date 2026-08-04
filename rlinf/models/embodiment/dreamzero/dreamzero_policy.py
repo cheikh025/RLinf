@@ -100,6 +100,9 @@ class DreamZeroPolicy(VLA, BasePolicy):
         self._bok_random_rng = None
         self._bok_exec_alias_warned = False
         self._bok_log_terms_announced = False
+        # Per-candidate guidance scales when bok_cfg_list is set; logged to the
+        # best-of-K jsonl for provenance. None on a normal seed-varied run.
+        self._bok_last_cfgs = None
 
     # This method is called in FSDPModelManager.setup_model_and_optimizer
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs={}):
@@ -404,6 +407,25 @@ class DreamZeroPolicy(VLA, BasePolicy):
         base_seed = getattr(self.config, "bok_base_seed", None)
         base_seed = original_seed if base_seed is None else int(base_seed)
 
+        # bok_cfg_list: hold the seed FIXED and vary the guidance scale across
+        # candidates instead. Isolates the effect of cfg on the sampled action,
+        # since every candidate then shares the same initial noise. Repeat a
+        # value in the list to get a null pair (identical seed AND cfg) whose
+        # pairwise distance must be 0 if nothing leaks between candidates.
+        cfg_list = getattr(self.config, "bok_cfg_list", None)
+        original_cfg = getattr(action_head, "cfg_scale", None)
+        if cfg_list is not None:
+            cfg_list = [float(c) for c in cfg_list]
+            if original_cfg is None:
+                raise AttributeError(
+                    "bok_cfg_list is set but the action head has no `cfg_scale`."
+                )
+            if len(cfg_list) != num_candidates:
+                raise ValueError(
+                    f"bok_cfg_list has {len(cfg_list)} entries but best_of_k="
+                    f"{num_candidates}; they must match."
+                )
+
         need_cons = self._cons_dreams_needed()
         need_prog = self._prog_dreams_needed()
         need_latents = self._latents_needed()
@@ -412,9 +434,15 @@ class DreamZeroPolicy(VLA, BasePolicy):
         cons_inputs = []  # per-candidate decoded RGB canvases for the IDM
         prog_dreams = []  # per-candidate decoded RGB canvases for the progress term
         latents = []  # per-candidate pre-decode VAE latents (consensus baseline)
+        cfgs = []
         try:
             for k in range(num_candidates):
-                seed = base_seed + k
+                if cfg_list is None:
+                    seed = base_seed + k
+                else:
+                    seed = base_seed  # fixed: cfg is the only thing that varies
+                    action_head.cfg_scale = cfg_list[k]
+                    cfgs.append(cfg_list[k])
                 action_head.seed = seed
                 with torch.no_grad():
                     pred = self.lazy_joint_video_action_causal(normalized_input)
@@ -447,6 +475,9 @@ class DreamZeroPolicy(VLA, BasePolicy):
                 )
         finally:
             action_head.seed = original_seed
+            if cfg_list is not None:
+                action_head.cfg_scale = original_cfg
+        self._bok_last_cfgs = cfgs or None
 
         # Env-space actions per candidate (the real env dims; computed once,
         # used for selection and for diversity logging).
@@ -1088,6 +1119,8 @@ class DreamZeroPolicy(VLA, BasePolicy):
             "chosen_counts": chosen_counts,
             "env_actions_per_candidate": [np.asarray(a).tolist() for a in env_actions],
         }
+        if self._bok_last_cfgs is not None:
+            info["cfg_scales"] = self._bok_last_cfgs
         info.update(pairwise_info)
         if select_info is not None:
             info["prm"] = select_info
