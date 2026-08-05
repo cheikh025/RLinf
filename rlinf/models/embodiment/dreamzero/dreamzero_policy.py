@@ -103,13 +103,6 @@ class DreamZeroPolicy(VLA, BasePolicy):
         # Per-candidate guidance scales when bok_cfg_list is set; logged to the
         # best-of-K jsonl for provenance. None on a normal seed-varied run.
         self._bok_last_cfgs = None
-        # Per-candidate, per-denoising-step guidance schedules when
-        # bok_cfg_schedules is set, plus the cfg_scale read count observed for
-        # each candidate. Both are logged to the jsonl; the read count is what
-        # proves the schedule landed on the steps it was meant to. None on a
-        # run that does not schedule guidance. See patch/cfg_schedule.py.
-        self._bok_last_cfg_schedules = None
-        self._bok_last_cfg_reads = None
 
     # This method is called in FSDPModelManager.setup_model_and_optimizer
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs={}):
@@ -414,12 +407,26 @@ class DreamZeroPolicy(VLA, BasePolicy):
         base_seed = getattr(self.config, "bok_base_seed", None)
         base_seed = original_seed if base_seed is None else int(base_seed)
 
-        # bok_cfg_list: hold the seed FIXED and vary the guidance scale across
-        # candidates instead. Isolates the effect of cfg on the sampled action,
-        # since every candidate then shares the same initial noise. Repeat a
-        # value in the list to get a null pair (identical seed AND cfg) whose
-        # pairwise distance must be 0 if nothing leaks between candidates.
+        # bok_cfg_list: give candidate k its own guidance scale cfg_list[k].
+        #
+        # bok_cfg_vary_seed selects what else varies:
+        #   False (default) -- the seed is held FIXED at base_seed, so cfg is
+        #       the ONLY difference between candidates. This isolates the effect
+        #       of cfg, and repeating a value in the list yields a true null pair
+        #       (identical seed AND cfg) whose distance must be 0 if nothing
+        #       leaks between candidates. Used by dreamzero_run_cfgdiv.sh.
+        #   True -- candidate k gets base_seed + k as well, so seed and cfg vary
+        #       together. This is the diversity setting: it stacks the two
+        #       effects instead of separating them, and there is no null pair.
+        #
+        # Guidance is applied to the video stream only (the action step consumes
+        # flow_pred_cond_action, which is never cfg-combined), so cfg reaches the
+        # actions indirectly, through the video latent conditioning the next
+        # forward pass. Never use exactly 1.0: groot guards the negative branch
+        # with `if self.cfg_scale != 1.0`, and dropping it makes the sampling
+        # loop fail on predictions[1]. Use 1.001 for near-unguided sampling.
         cfg_list = getattr(self.config, "bok_cfg_list", None)
+        cfg_vary_seed = bool(getattr(self.config, "bok_cfg_vary_seed", False))
         original_cfg = getattr(action_head, "cfg_scale", None)
         if cfg_list is not None:
             cfg_list = [float(c) for c in cfg_list]
@@ -432,49 +439,12 @@ class DreamZeroPolicy(VLA, BasePolicy):
                     f"bok_cfg_list has {len(cfg_list)} entries but best_of_k="
                     f"{num_candidates}; they must match."
                 )
-
-        # bok_cfg_schedules: one guidance schedule per candidate, one entry per
-        # denoising step, e.g. [[1.001, 3.0, 5.0, 5.0], [5.0, 3.0, 1.001, 1.001]].
-        # Unlike bok_cfg_list this leaves the seed alone, so candidates differ in
-        # BOTH seed (base_seed + k) and guidance trajectory.
-        #
-        # Guidance is applied to the video stream only -- the action step uses
-        # flow_pred_cond_action, which is never cfg-combined -- so a schedule
-        # reaches the actions solely through the video latent that conditions
-        # the next forward pass. The value at the LAST step therefore cannot
-        # affect the actions at all; put no weight on it.
-        #
-        # bok_cfg_probe runs the descriptor in counting mode (no schedule
-        # applied) to measure bok_cfg_reads_per_step. Run it once before any
-        # real run: if cfg_scale is read more than once per step the schedule
-        # would otherwise be silently misaligned.
-        cfg_schedules = getattr(self.config, "bok_cfg_schedules", None)
-        cfg_probe = bool(getattr(self.config, "bok_cfg_probe", False))
-        reads_per_step = int(getattr(self.config, "bok_cfg_reads_per_step", 1) or 1)
-        cfg_ctl = None
-        if cfg_schedules is not None or cfg_probe:
-            if cfg_list is not None:
+            if any(c == 1.0 for c in cfg_list):
                 raise ValueError(
-                    "bok_cfg_list and bok_cfg_schedules are mutually exclusive: "
-                    "the first pins the seed and varies a scalar cfg, the second "
-                    "varies the seed and schedules cfg across denoising steps."
+                    "bok_cfg_list contains exactly 1.0, which makes groot skip "
+                    "the negative branch (`if self.cfg_scale != 1.0`) and the "
+                    "sampling loop then fails on predictions[1]. Use 1.001."
                 )
-            from rlinf.models.embodiment.dreamzero.patch import cfg_schedule as cfg_ctl
-
-            if cfg_schedules is not None:
-                cfg_schedules = [[float(c) for c in s] for s in cfg_schedules]
-                if len(cfg_schedules) != num_candidates:
-                    raise ValueError(
-                        f"bok_cfg_schedules has {len(cfg_schedules)} entries but "
-                        f"best_of_k={num_candidates}; they must match."
-                    )
-                lengths = {len(s) for s in cfg_schedules}
-                if len(lengths) != 1:
-                    raise ValueError(
-                        f"bok_cfg_schedules entries have differing lengths {sorted(lengths)}; "
-                        "every candidate must schedule the same number of denoising steps."
-                    )
-            cfg_ctl.install(action_head)
 
         need_cons = self._cons_dreams_needed()
         need_prog = self._prog_dreams_needed()
@@ -485,32 +455,17 @@ class DreamZeroPolicy(VLA, BasePolicy):
         prog_dreams = []  # per-candidate decoded RGB canvases for the progress term
         latents = []  # per-candidate pre-decode VAE latents (consensus baseline)
         cfgs = []
-        cfg_reads = []
         try:
             for k in range(num_candidates):
                 if cfg_list is None:
                     seed = base_seed + k
                 else:
-                    seed = base_seed  # fixed: cfg is the only thing that varies
+                    seed = base_seed + k if cfg_vary_seed else base_seed
                     action_head.cfg_scale = cfg_list[k]
                     cfgs.append(cfg_list[k])
                 action_head.seed = seed
-                if cfg_ctl is not None:
-                    cfg_ctl.begin_candidate(
-                        action_head,
-                        None if cfg_schedules is None else cfg_schedules[k],
-                        reads_per_step,
-                    )
                 with torch.no_grad():
                     pred = self.lazy_joint_video_action_causal(normalized_input)
-                if cfg_ctl is not None:
-                    cfg_reads.append(cfg_ctl.end_candidate(action_head))
-                    self._check_cfg_schedule_reads(
-                        cfg_reads[-1],
-                        None if cfg_schedules is None else cfg_schedules[k],
-                        reads_per_step,
-                        k,
-                    )
                 candidates.append(pred)
                 seeds.append(seed)
                 video_pred = pred.get("video_pred")
@@ -542,14 +497,7 @@ class DreamZeroPolicy(VLA, BasePolicy):
             action_head.seed = original_seed
             if cfg_list is not None:
                 action_head.cfg_scale = original_cfg
-            if cfg_ctl is not None:
-                # Disarm: leave the descriptor installed (re-installing per call
-                # is pointless churn) but serve the static scale again, so any
-                # read outside best-of-K behaves exactly as it did before.
-                cfg_ctl.begin_candidate(action_head, None, 1)
         self._bok_last_cfgs = cfgs or None
-        self._bok_last_cfg_schedules = cfg_schedules
-        self._bok_last_cfg_reads = cfg_reads or None
 
         # Env-space actions per candidate (the real env dims; computed once,
         # used for selection and for diversity logging).
@@ -585,60 +533,6 @@ class DreamZeroPolicy(VLA, BasePolicy):
             select_info=select_info,
         )
         return selected_pred
-
-    def _check_cfg_schedule_reads(
-        self,
-        reads: int,
-        schedule: Optional[list],
-        reads_per_step: int,
-        candidate: int,
-    ) -> None:
-        """Verify a guidance schedule landed on the denoising steps it targeted.
-
-        The schedule is delivered by counting ``cfg_scale`` reads, so it is only
-        correct if the head reads it a fixed number of times per step. That is
-        not guaranteed -- a ``cfg_scale != 1.0`` guard around the unconditional
-        pass, for instance, would double the count -- and a mismatch would
-        silently shift every value onto the wrong step. So it is checked rather
-        than assumed.
-
-        With ``schedule=None`` (``bok_cfg_probe``) nothing is enforced: the
-        observed count is reported so ``bok_cfg_reads_per_step`` can be set from
-        it before any real run.
-
-        Args:
-            reads: ``cfg_scale`` reads observed during this candidate.
-            schedule: The schedule applied, or ``None`` when probing.
-            reads_per_step: Configured reads per denoising step.
-            candidate: Candidate index, for the message.
-
-        Raises:
-            RuntimeError: If the observed count contradicts the schedule.
-        """
-        if schedule is None:
-            # Report every candidate of the first call only: enough to confirm
-            # the count is stable across candidates, without flooding the log.
-            if self._bok_call_count == 0:
-                logger.warning(
-                    "[dreamzero cfg-probe] candidate %d read cfg_scale %d times. "
-                    "Set bok_cfg_reads_per_step = %d / (number of denoising "
-                    "steps); it must divide exactly. Nothing was scheduled on "
-                    "this run.",
-                    candidate,
-                    reads,
-                    reads,
-                )
-            return
-
-        expected = reads_per_step * len(schedule)
-        if reads != expected:
-            raise RuntimeError(
-                f"[dreamzero cfg-schedule] candidate {candidate} read cfg_scale "
-                f"{reads} times but the schedule expects {expected} "
-                f"({reads_per_step} read(s) x {len(schedule)} steps). The "
-                f"schedule would be misaligned with the denoising steps. Re-run "
-                f"with bok_cfg_probe=true to measure the true read count."
-            )
 
     def _cons_dreams_needed(self) -> bool:
         """Whether best-of-K must prepare the consistency input this call: only
@@ -1247,10 +1141,6 @@ class DreamZeroPolicy(VLA, BasePolicy):
         }
         if self._bok_last_cfgs is not None:
             info["cfg_scales"] = self._bok_last_cfgs
-        if self._bok_last_cfg_schedules is not None:
-            info["cfg_schedules"] = self._bok_last_cfg_schedules
-        if self._bok_last_cfg_reads is not None:
-            info["cfg_scale_reads"] = self._bok_last_cfg_reads
         info.update(pairwise_info)
         if select_info is not None:
             info["prm"] = select_info
