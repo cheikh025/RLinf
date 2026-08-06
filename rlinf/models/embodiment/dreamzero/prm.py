@@ -278,9 +278,7 @@ def _load_consistency_idm(path: str, device: str):
             )
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     if "idm_cfg" not in ckpt or "model" not in ckpt:
-        raise KeyError(
-            f"IDM checkpoint {ckpt_path!r} missing 'idm_cfg'/'model'."
-        )
+        raise KeyError(f"IDM checkpoint {ckpt_path!r} missing 'idm_cfg'/'model'.")
     from rlinf.models.embodiment.dreamzero.idm.model import IDM, IDMConfig
 
     cfg = ckpt["idm_cfg"]
@@ -384,9 +382,7 @@ def _split_prm_terms(raw_terms: Any) -> list[str]:
         if terms.startswith("[") and terms.endswith("]"):
             terms = terms[1:-1]
         return [
-            item.strip()
-            for item in terms.replace(";", ",").split(",")
-            if item.strip()
+            item.strip() for item in terms.replace(";", ",").split(",") if item.strip()
         ]
     try:
         return [str(item).strip() for item in raw_terms if str(item).strip()]
@@ -612,6 +608,15 @@ class DreamZeroPRM:
     ``bok_cons_grip_w``; and for progress ``bok_progress_model_path``
     (Robometer-4B-LIBERO checkpoint dir), ``bok_progress_device``,
     ``bok_prog_lambda``, ``bok_progress_batch_size``.
+
+    ``bok_candidate_relative`` (default False) switches the combination from a
+    raw lambda-weighted sum to a candidate-relative one; ``bok_crel_c``
+    (default 0.01) sets the epsilon floor as a fraction of each term's nominal
+    scale. See :meth:`_candidate_relative`. The raw sum is dominated by whichever
+    term happens to have the widest spread -- measured over 6554 decisions,
+    consistency has 4.3x the within-decision spread of progress, so a raw
+    ``cons + prog`` follows consistency on 85% of decisions and progress on 35%.
+    Candidate-relative scoring brings that to 58%/56%.
     """
 
     #: EVA's bounded score mapping (logged only; argmin of penalty is the
@@ -628,6 +633,15 @@ class DreamZeroPRM:
         self.uses_progress = "progress" in self.active_terms
         self.exec_lambda = float(getattr(config, "bok_exec_lambda", 1.0))
         self.cons_lambda = float(getattr(config, "bok_cons_lambda", 1.0))
+
+        # Candidate-relative scoring (see _candidate_relative). Off by default:
+        # it changes which candidate is executed, so every previously logged
+        # run stays reproducible unless this is explicitly switched on. When on,
+        # the lambdas should normally be left at 1.0 -- the normalisation is
+        # what balances the terms, and a lambda on top re-introduces exactly the
+        # arbitrary weight it removes.
+        self.candidate_relative = bool(getattr(config, "bok_candidate_relative", False))
+        self.crel_c = float(getattr(config, "bok_crel_c", 0.01))
 
         self.exec_scorer = None
         if self.uses_exec:
@@ -692,6 +706,48 @@ class DreamZeroPRM:
         """
         return self.SCORE_MAX * (1.0 + penalty / self.SCORE_P0) ** (-self.SCORE_GAMMA)
 
+    def _candidate_relative(self, score_env: torch.Tensor, scale: float):
+        """Normalise a term across the K candidates of each decision.
+
+        ``(r - mean) / (std + eps)`` with mean and std taken over the candidate
+        axis, so every term is expressed as "how much better than its siblings
+        is this candidate, relative to how much they differ at all".
+
+        Why this and not plain z-scoring (``eps = 0``): z forces every term to
+        the same spread, so a term that cannot separate the candidates in a
+        given decision is still amplified to a full +-1 vote. Measured on the
+        500-episode randomised log, a decision whose four consistency scores
+        span 0.12 comes out with a LARGER z-spread than one spanning 3.03. The
+        eps floor makes a term contribute in proportion to how much it actually
+        discriminates, so an uninformative term self-mutes.
+
+        Why eps is derived from the term's nominal scale rather than measured:
+        a measured scale (e.g. the median observed spread) would have to come
+        from a reference run, and it does not transfer -- consistency's spread
+        is 0.183 at fixed cfg but 0.255 when cfg varies across candidates, a
+        39% shift. ``SCORE_MAX`` and the progress term's [0, 1] range are fixed
+        by construction, so eps stays correct for any candidate pool.
+
+        The response is flat for ``bok_crel_c`` anywhere in 0.005-0.1, so the
+        constant is not load-bearing.
+
+        Args:
+            score_env: ``[K, B]`` per-candidate, per-env scores.
+            scale: the term's nominal full-scale value (``SCORE_MAX`` for the
+                bounded exec/consistency scores, ``1.0`` for progress).
+
+        Returns:
+            ``[K, B]`` normalised scores, or ``score_env`` unchanged when
+            candidate-relative scoring is off.
+        """
+        if not self.candidate_relative:
+            return score_env
+        if score_env.shape[0] < 2:
+            return torch.zeros_like(score_env)
+        mean = score_env.mean(dim=0, keepdim=True)
+        std = score_env.std(dim=0, unbiased=False, keepdim=True)
+        return (score_env - mean) / (std + self.crel_c * float(scale))
+
     @staticmethod
     def _add_term(
         combined: Optional[torch.Tensor],
@@ -742,9 +798,12 @@ class DreamZeroPRM:
                 info["score"] = exec_score_env[:, 0].tolist()
                 info["exec_penalty"] = terms["penalty"]
                 info["exec_score"] = info["score"]
-            combined_env = self._add_term(
-                combined_env, self.exec_lambda * exec_score_env
+            exec_contrib = self.exec_lambda * self._candidate_relative(
+                exec_score_env, self.SCORE_MAX
             )
+            combined_env = self._add_term(combined_env, exec_contrib)
+            if self.candidate_relative:
+                info["exec_contrib_per_env"] = exec_contrib.tolist()
 
         if self.uses_consistency:
             dreams = context.get("dream_input")
@@ -758,9 +817,12 @@ class DreamZeroPRM:
                 cons["cons_penalty_per_env"], dtype=torch.float32
             )
             cons_score_env = self._bounded(cons_pen_env)
-            combined_env = self._add_term(
-                combined_env, self.cons_lambda * cons_score_env
+            cons_contrib = self.cons_lambda * self._candidate_relative(
+                cons_score_env, self.SCORE_MAX
             )
+            combined_env = self._add_term(combined_env, cons_contrib)
+            if self.candidate_relative:
+                info["cons_contrib_per_env"] = cons_contrib.tolist()
             info.update(cons)
             info["cons_score_per_env"] = cons_score_env.tolist()
             if cons_score_env.shape[1] == 1:
@@ -777,9 +839,14 @@ class DreamZeroPRM:
             prog_score_env = torch.as_tensor(
                 prog["progress_reward_per_env"], dtype=torch.float32
             )
-            combined_env = self._add_term(
-                combined_env, self.prog_lambda * prog_score_env
+            # progress_reward is already [0, 1] by construction, so its nominal
+            # full scale is 1.0 rather than SCORE_MAX
+            prog_contrib = self.prog_lambda * self._candidate_relative(
+                prog_score_env, 1.0
             )
+            combined_env = self._add_term(combined_env, prog_contrib)
+            if self.candidate_relative:
+                info["prog_contrib_per_env"] = prog_contrib.tolist()
             info.update(prog)
 
         if combined_env is None:
